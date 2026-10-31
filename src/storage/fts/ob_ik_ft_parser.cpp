@@ -40,6 +40,62 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+
+// IK 的三本字典（main / quan / stopword）以前是每个 ObIKFTParser 各建一份：
+// 一次 TOKENIZE() 调用、或建索引时的一篇文档，都要重新 load_cache + 构造三本
+// ObFTRangeDict。实测这部分固定开销约占一次 tokenize 的七成（见提交说明里的
+// “TOKENIZE 耗时 vs 文本长度”实验：词本身只占几十微秒）。
+//
+// 这里按线程缓存一份：每个线程首次使用时构建，之后一直复用。
+// 选择线程级而不是进程级，是为了不引入跨线程生命周期/加锁问题——字典建好之后
+// 只读（ObIFTDict::match 都是 const），线程内复用不存在并发写。
+struct ObIKSharedDicts
+{
+  ObIKSharedDicts()
+      : cache_main_(nullptr), cache_quan_(nullptr), cache_stop_(nullptr),
+        dict_main_(nullptr), dict_quan_(nullptr), dict_stop_(nullptr), ready_(false)
+  {
+  }
+  common::ObArenaAllocator allocator_;
+  ObFTCacheRangeContainer *cache_main_;
+  ObFTCacheRangeContainer *cache_quan_;
+  ObFTCacheRangeContainer *cache_stop_;
+  ObIFTDict *dict_main_;
+  ObIFTDict *dict_quan_;
+  ObIFTDict *dict_stop_;
+  bool ready_;
+};
+
+// 载入（必要时构建）一本字典的 cache 容器，并据此构造只读字典对象。
+int load_one_shared_ik_dict(ObFTDictHub *hub,
+                            ObIKSharedDicts &shared,
+                            const ObFTDictDesc &desc,
+                            ObFTCacheRangeContainer *&cache,
+                            ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(hub)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(cache = OB_NEWx(ObFTCacheRangeContainer, &shared.allocator_, shared.allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(hub->load_cache(desc, *cache))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      if (OB_FAIL(hub->build_cache(desc, *cache))) {
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict, &shared.allocator_, shared.allocator_, cache, desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(dict->init())) {
+  }
+  return ret;
+}
+
+}  // namespace
+
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -231,13 +287,8 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
 int ObIKFTParser::init_dict(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
-  ObIFTDict *tmp_dict = nullptr;
+  static thread_local ObIKSharedDicts shared_dicts;
 
-  if (OB_ISNULL(hub_)) {
-    ret = OB_ERR_UNEXPECTED;
-  }
-
-  ObFTRangeDict *dict = nullptr;
   ObFTDictDesc main_dict_desc("main_dict",
                               ObFTDictType::DICT_IK_MAIN,
                               ObCharsetType::CHARSET_UTF8MB4,
@@ -253,20 +304,28 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
                                   ObCharsetType::CHARSET_UTF8MB4,
                                   ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
-  if (should_read_newest_table()) {
-    // clear dict cache, always false now
-  } else {
-    if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
-    } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
+  if (OB_ISNULL(hub_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!shared_dicts.ready_) {
+    // 本线程第一次分词：把三本字典建好并缓存起来
+    if (OB_FAIL(load_one_shared_ik_dict(hub_, shared_dicts, main_dict_desc,
+                                        shared_dicts.cache_main_, shared_dicts.dict_main_))) {
+    } else if (OB_FAIL(load_one_shared_ik_dict(hub_, shared_dicts, quan_dict_desc,
+                                               shared_dicts.cache_quan_, shared_dicts.dict_quan_))) {
+    } else if (OB_FAIL(load_one_shared_ik_dict(hub_, shared_dicts, stopword_dict_desc,
+                                               shared_dicts.cache_stop_, shared_dicts.dict_stop_))) {
+    } else {
+      shared_dicts.ready_ = true;
     }
   }
 
   if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+  } else {
+    // 借用线程级共享字典：不归本对象所有，reset() 里不能析构
+    dict_main_ = shared_dicts.dict_main_;
+    dict_quan_ = shared_dicts.dict_quan_;
+    dict_stop_ = shared_dicts.dict_stop_;
+    owns_dicts_ = false;
   }
 
   return ret;
@@ -366,18 +425,25 @@ void ObIKFTParser::reset()
   cache_quan_.reset();
   cache_stop_.reset();
 
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
+  // 字典可能来自线程级共享缓存，那种情况下不归本对象所有，绝不能在这里析构
+  if (owns_dicts_) {
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
+    }
   }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
+  owns_dicts_ = true;
 
   is_inited_ = false;
 }

@@ -46,7 +46,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        owns_dicts_(true)
   {
   }
 
@@ -106,6 +107,10 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+
+  // 字典是否归本对象所有。走线程级共享字典时置 false，reset() 不能析构它们，
+  // 否则会把别的调用还在用的字典 free 掉（double free / 悬垂指针）。
+  bool owns_dicts_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };
