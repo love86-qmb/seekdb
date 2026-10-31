@@ -91,6 +91,8 @@ int ObAiModelEndpointInfo::deep_copy(
   } else if (OB_FAIL(ob_write_string(allocator, other.parameters_, parameters_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.request_transform_fn_, request_transform_fn_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.response_transform_fn_, response_transform_fn_))) {
+  } else {
+    max_concurrency_ = other.max_concurrency_;
   }
   return ret;
 }
@@ -168,6 +170,22 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("parameters", parameters_)
       EXTRACT_JSON_ELEM_STR("request_transform_fn", request_transform_fn_)
       EXTRACT_JSON_ELEM_STR("response_transform_fn", response_transform_fn_)
+      // max_concurrency bounds how many requests may be in flight at once, so it
+      // has to be a real integer inside [1, 1024]; anything else is a bad value.
+      if (elem.first.case_compare("max_concurrency") == 0) {
+        if (elem.second->json_type() != ObJsonNodeType::J_INT) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("max_concurrency must be an integer", K(ret), K(elem.first), K(elem.second->json_type()));
+        } else if (elem.second->get_int() < DEFAULT_MAX_CONCURRENCY
+                   || elem.second->get_int() > MAX_CONCURRENCY_LIMIT) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("max_concurrency out of range", K(ret), K(elem.second->get_int()), K(MAX_CONCURRENCY_LIMIT));
+        } else {
+          max_concurrency_ = elem.second->get_int();
+        }
+      } else
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();
