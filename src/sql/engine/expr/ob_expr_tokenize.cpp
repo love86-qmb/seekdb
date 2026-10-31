@@ -39,6 +39,124 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+
+// TOKENIZE() is deterministic for the built-in parsers.  Repeated literal
+// invocations are common in diagnostics and generated SQL, but previously
+// rebuilt the parser, word map and JSON tree every time.  Keep one bounded
+// result per worker thread.  Dynamic arguments and large values deliberately
+// bypass this cache.
+struct ObTokenizeConstCache
+{
+  static constexpr int64_t MAX_KEY_SIZE = 4 * 1024;
+  static constexpr int64_t MAX_RESULT_SIZE = 16 * 1024;
+  static constexpr int64_t MAX_ARG_COUNT = 3;
+
+  ObTokenizeConstCache() : arg_count_(0), key_size_(0), result_size_(0), valid_(false)
+  {
+    MEMSET(arg_lengths_, 0, sizeof(arg_lengths_));
+    MEMSET(arg_types_, 0, sizeof(arg_types_));
+    MEMSET(arg_collations_, 0, sizeof(arg_collations_));
+    MEMSET(arg_is_null_, 0, sizeof(arg_is_null_));
+  }
+
+  bool can_cache(const ObExpr &expr) const
+  {
+    bool can_cache = expr.arg_cnt_ > 0 && expr.arg_cnt_ <= MAX_ARG_COUNT;
+    for (int64_t i = 0; can_cache && i < expr.arg_cnt_; ++i) {
+      can_cache = OB_NOT_NULL(expr.args_[i]) && expr.args_[i]->is_const_expr();
+    }
+    return can_cache;
+  }
+
+  int get(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, bool &hit) const
+  {
+    int ret = OB_SUCCESS;
+    hit = valid_ && can_cache(expr) && arg_count_ == expr.arg_cnt_;
+    int64_t key_pos = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && hit && i < expr.arg_cnt_; ++i) {
+      ObDatum *datum = nullptr;
+      if (OB_FAIL(expr.args_[i]->eval(ctx, datum))) {
+      } else if (OB_ISNULL(datum)
+                 || arg_types_[i] != expr.args_[i]->datum_meta_.type_
+                 || arg_collations_[i] != expr.args_[i]->datum_meta_.cs_type_
+                 || arg_is_null_[i] != datum->is_null()) {
+        hit = false;
+      } else if (!datum->is_null()) {
+        const ObString value = datum->get_string();
+        if (arg_lengths_[i] != value.length()
+            || key_pos + value.length() > key_size_
+            || 0 != MEMCMP(key_ + key_pos, value.ptr(), value.length())) {
+          hit = false;
+        } else {
+          key_pos += value.length();
+        }
+      }
+    }
+    if (OB_SUCC(ret) && hit) {
+      char *buf = nullptr;
+      if (OB_ISNULL(buf = expr.get_str_res_mem(ctx, result_size_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(buf, result_, result_size_);
+        res.set_string(buf, result_size_);
+      }
+    }
+    return ret;
+  }
+
+  void put(const ObExpr &expr, ObEvalCtx &ctx, const ObDatum &res)
+  {
+    valid_ = false;
+    if (!can_cache(expr) || res.is_null() || res.get_string().length() > MAX_RESULT_SIZE) {
+      return;
+    }
+    int64_t key_pos = 0;
+    bool storable = true;
+    for (int64_t i = 0; storable && i < expr.arg_cnt_; ++i) {
+      ObDatum *datum = nullptr;
+      if (OB_SUCCESS != expr.args_[i]->eval(ctx, datum) || OB_ISNULL(datum)) {
+        storable = false;
+      } else {
+        arg_types_[i] = expr.args_[i]->datum_meta_.type_;
+        arg_collations_[i] = expr.args_[i]->datum_meta_.cs_type_;
+        arg_is_null_[i] = datum->is_null();
+        arg_lengths_[i] = datum->is_null() ? 0 : datum->get_string().length();
+        if (key_pos + arg_lengths_[i] > MAX_KEY_SIZE) {
+          storable = false;
+        } else if (!datum->is_null()) {
+          MEMCPY(key_ + key_pos, datum->get_string().ptr(), arg_lengths_[i]);
+          key_pos += arg_lengths_[i];
+        }
+      }
+    }
+    if (storable) {
+      const ObString value = res.get_string();
+      MEMCPY(result_, value.ptr(), value.length());
+      arg_count_ = expr.arg_cnt_;
+      key_size_ = key_pos;
+      result_size_ = value.length();
+      valid_ = true;
+    }
+  }
+
+  int64_t arg_count_;
+  int64_t arg_lengths_[MAX_ARG_COUNT];
+  ObObjType arg_types_[MAX_ARG_COUNT];
+  ObCollationType arg_collations_[MAX_ARG_COUNT];
+  bool arg_is_null_[MAX_ARG_COUNT];
+  int64_t key_size_;
+  int64_t result_size_;
+  bool valid_;
+  char key_[MAX_KEY_SIZE];
+  char result_[MAX_RESULT_SIZE];
+};
+
+thread_local ObTokenizeConstCache TOKENIZE_CONST_CACHE;
+
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -53,23 +171,28 @@ ObExprTokenize::~ObExprTokenize() {}
 int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
-
-  ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
-
-  ObIJsonBase *json_result = nullptr;
-  TokenizeParam param;
+  bool cache_hit = false;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (OB_FAIL(TOKENIZE_CONST_CACHE.get(expr, ctx, expr_datum, cache_hit))) {
+  } else if (cache_hit) {
+  } else {
+    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
+    common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
+    ObIJsonBase *json_result = nullptr;
+    TokenizeParam param;
+    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    } else {
+      TOKENIZE_CONST_CACHE.put(expr, ctx, expr_datum);
+    }
   }
 
   return ret;
