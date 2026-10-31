@@ -3466,6 +3466,12 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
               hidden_column.reset();
               hidden_column.alter_type_ = OB_DDL_ADD_COLUMN;
               if (OB_FAIL(fill_ai_hidden_column(alter_column_schema, hid_idx, hidden_column))) {
+              } else if (0 == hid_idx
+                         && OB_FAIL(fill_ai_column_deps(
+                                      alter_table_stmt->get_alter_table_schema(),
+                                      alter_table_stmt->get_ai_column_info(
+                                        alter_table_stmt->get_ai_column_count() - 1),
+                                      hidden_column))) {
               } else if (OB_FAIL(alter_table_stmt->add_column(hidden_column))) {
               }
             }

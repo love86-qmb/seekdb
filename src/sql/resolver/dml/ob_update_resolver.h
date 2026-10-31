@@ -58,6 +58,16 @@ private:
   int check_safe_update_mode(ObUpdateStmt *update_stmt);
   int resolve_update_constraints();
   int generate_batched_stmt_info();
+  // An AI column is derived data: whenever the statement assigns one of the columns
+  // its expression depends on (or any primary key column) the AI column has to be
+  // reset to NULL so that the async worker computes it again. The result is an extra
+  // "<ai column> = NULL" assignment, which is a real column write and therefore
+  // rolled back together with the rest of the statement.
+  int resolve_ai_column_invalidation(common::ObIArray<ObTableAssignment> &table_assigns);
+  int add_ai_column_invalidation(const share::schema::ObTableSchema &table_schema,
+                                 const TableItem &table_item,
+                                 common::ObIArray<ObTableAssignment> &table_assigns,
+                                 const common::ObIArray<ObColumnRefRawExpr *> &set_columns);
 };
 
 } // namespace sql

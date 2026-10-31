@@ -37,12 +37,22 @@ public:
     column_name_.reset();
     normalized_expr_.reset();
     sync_mode_.reset();
+    deps_.reset();
+    expr_text_.reset();
     max_retries_ = -1;
     expr_node_ = NULL;
   }
   common::ObString column_name_;
   common::ObString normalized_expr_;
   common::ObString sync_mode_;
+  // names of the table columns the AI column expression depends on, comma separated.
+  // It is persisted as the comment of the hidden "<column>_ai_state" column because
+  // the async update path has to know which columns invalidate the AI column.
+  common::ObString deps_;
+  // "<model name>\x1f<user side value expression>", persisted into
+  // __all_ai_column.expr_text: the background worker renders the prompt of a row from
+  // the value expression and resolves the endpoint from the model name.
+  common::ObString expr_text_;
   int64_t max_retries_;
   // the resolved expression parse node, only used inside the resolver
   const void *expr_node_;

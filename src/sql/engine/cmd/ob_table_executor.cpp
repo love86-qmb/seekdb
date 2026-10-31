@@ -154,7 +154,7 @@ int add_ai_column_row(ObDMLSqlSplicer &dml,
     } else if (OB_FAIL(dml.add_column("state_column_id", hid_column_id[0]))) {
     } else if (OB_FAIL(dml.add_column("request_column_id", hid_column_id[1]))) {
     } else if (OB_FAIL(dml.add_column("result_spec_column_id", hid_column_id[2]))) {
-    } else if (OB_FAIL(dml.add_column("expr_text", ObHexEscapeSqlStr(info.normalized_expr_)))) {
+    } else if (OB_FAIL(dml.add_column("expr_text", ObHexEscapeSqlStr(info.expr_text_)))) {
     } else if (OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(info.normalized_expr_)))) {
     } else if (OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(info.sync_mode_)))) {
     } else if (OB_FAIL(dml.add_column("max_retries", info.max_retries_))) {

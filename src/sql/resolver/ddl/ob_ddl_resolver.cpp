@@ -1981,7 +1981,9 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
 
 namespace {
 // collect all identifiers appearing in an expression parse tree, the AI column
-// clause is never resolved into raw expressions so a plain parse tree walk is enough
+// clause is never resolved into raw expressions so a plain parse tree walk is enough.
+// The first child of a system function node is the function name itself, it is
+// skipped so that "concat" and "AI_COMPLETE" never look like column references.
 int collect_ident_names(const ParseNode *node, ObIArray<ObString> &names)
 {
   int ret = OB_SUCCESS;
@@ -1992,8 +1994,120 @@ int collect_ident_names(const ParseNode *node, ObIArray<ObString> &names)
     }
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
-      if (NULL != node->children_ && NULL != node->children_[i]) {
+      if (T_FUN_SYS == node->type_ && 0 == i) {
+        // function name
+      } else if (NULL != node->children_ && NULL != node->children_[i]) {
         if (OB_FAIL(collect_ident_names(node->children_[i], names))) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// split "name1,name2,..." (the deps_ of an AI column) into separate names
+int split_ident_names(const ObString &deps, ObIArray<ObString> &names)
+{
+  int ret = OB_SUCCESS;
+  int64_t start = 0;
+  while (OB_SUCC(ret) && start <= deps.length()) {
+    int64_t end = start;
+    while (end < deps.length() && ',' != deps[end]) {
+      ++end;
+    }
+    if (end > start) {
+      if (OB_FAIL(names.push_back(ObString(static_cast<int32_t>(end - start),
+                                           deps.ptr() + start)))) {
+      }
+    }
+    start = end + 1;
+  }
+  return ret;
+}
+
+// The AI column expression text is "FUNC('model', <value expr>[, <arg>...])", the
+// background worker needs the <value expr> part to render the prompt of a row.
+// Only the first two arguments are interesting, they are separated by the first
+// top level comma outside of a string literal.
+int extract_value_expr_text(const ObString &expr_text, ObString &value_expr_text)
+{
+  int ret = OB_SUCCESS;
+  const char *ptr = expr_text.ptr();
+  const int64_t len = expr_text.length();
+  int64_t open_pos = -1;
+  int64_t inner_end = -1;
+  if (OB_ISNULL(ptr) || len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    // locate the argument list of the AI function call
+    for (int64_t i = 0; -1 == open_pos && i < len; ++i) {
+      if ('(' == ptr[i]) {
+        open_pos = i;
+      }
+    }
+    if (-1 != open_pos) {
+      int32_t depth = 0;
+      char quote = '\0';
+      for (int64_t i = open_pos; -1 == inner_end && i < len; ++i) {
+        const char c = ptr[i];
+        if ('\0' != quote) {
+          if (c == quote) {
+            quote = '\0';
+          }
+        } else if ('\'' == c || '"' == c) {
+          quote = c;
+        } else if ('(' == c) {
+          ++depth;
+        } else if (')' == c) {
+          --depth;
+          if (0 == depth) {
+            inner_end = i;
+          }
+        }
+      }
+    }
+    if (-1 == open_pos || -1 == inner_end) {
+      // not a plain function call, leave the value expression empty
+    } else {
+      // the first two arguments are separated by the first top level comma
+      int32_t depth = 0;
+      char quote = '\0';
+      int64_t arg_start = -1;
+      int64_t arg_end = -1;
+      for (int64_t i = open_pos; -1 == arg_end && i < inner_end; ++i) {
+        const char c = ptr[i];
+        if ('\0' != quote) {
+          if (c == quote) {
+            quote = '\0';
+          }
+        } else if ('\'' == c || '"' == c) {
+          quote = c;
+        } else if ('(' == c) {
+          ++depth;
+        } else if (')' == c) {
+          --depth;
+        } else if (',' == c && 1 == depth) {
+          if (-1 == arg_start) {
+            arg_start = i + 1;
+          } else {
+            arg_end = i;
+          }
+        }
+      }
+      if (-1 != arg_start) {
+        if (-1 == arg_end) {
+          arg_end = inner_end;
+        }
+        while (arg_start < arg_end && (' ' == ptr[arg_start] || '\t' == ptr[arg_start]
+                                       || '\n' == ptr[arg_start] || '\r' == ptr[arg_start])) {
+          ++arg_start;
+        }
+        while (arg_end > arg_start && (' ' == ptr[arg_end - 1] || '\t' == ptr[arg_end - 1]
+                                       || '\n' == ptr[arg_end - 1] || '\r' == ptr[arg_end - 1])) {
+          --arg_end;
+        }
+        if (arg_end > arg_start) {
+          value_expr_text.assign_ptr(ptr + arg_start, static_cast<int32_t>(arg_end - arg_start));
         }
       }
     }
@@ -2109,24 +2223,60 @@ int ObDDLResolver::resolve_ai_column_clause(ObColumnSchemaV2 &column,
       char *buf = NULL;
       static const char *JSON_PROMPT = "Return exactly one valid JSON value.";
       int64_t buf_len = expr_node->str_len_ + static_cast<int64_t>(strlen(JSON_PROMPT)) + 16;
+      // the columns this AI column depends on, used to invalidate it on UPDATE
+      ObSEArray<ObString, 8> dep_names;
+      ObSqlString dep_buf;
+      // "<model name>\x1f<value expression>", consumed by the background worker
+      ObString model_name;
+      ObString value_expr_text;
+      ObSqlString expr_text_buf;
       if (OB_ISNULL(ddl_stmt)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_ISNULL(buf = static_cast<char *>(allocator_->alloc(buf_len)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(collect_ident_names(expr_node, dep_names))) {
+      } else if (OB_FAIL(extract_value_expr_text(
+                   ObString(expr_node->str_len_, expr_node->str_value_), value_expr_text))) {
       } else {
-        int64_t pos = 0;
-        if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%.*s",
-                                    static_cast<int32_t>(expr_node->str_len_),
-                                    expr_node->str_value_))) {
-        } else if (column.is_json()
-                   && OB_FAIL(databuff_printf(buf, buf_len, pos, " ; %s", JSON_PROMPT))) {
+        // the first argument of the AI function is the model name
+        ParseNode *param_node = (T_FUN_SYS == expr_node->type_ && expr_node->num_child_ > 1)
+                                    ? expr_node->children_[1] : NULL;
+        if (NULL != param_node && T_EXPR_LIST == param_node->type_ && param_node->num_child_ > 0
+            && NULL != param_node->children_[0]) {
+          ParseNode *model_node = param_node->children_[0];
+          if (NULL != model_node->str_value_ && model_node->str_len_ > 0) {
+            model_name.assign_ptr(model_node->str_value_,
+                                  static_cast<int32_t>(model_node->str_len_));
+          }
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < dep_names.count(); ++i) {
+          if (OB_FAIL(dep_buf.append_fmt("%s%.*s", 0 == i ? "" : ",",
+                                         dep_names.at(i).length(), dep_names.at(i).ptr()))) {
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(expr_text_buf.append_fmt("%.*s\x1f%.*s", model_name.length(),
+                                                    model_name.ptr(),
+                                                    value_expr_text.length(),
+                                                    value_expr_text.ptr()))) {
         } else {
-          info.column_name_ = column.get_column_name_str();
-          info.normalized_expr_.assign_ptr(buf, static_cast<int32_t>(pos));
-          info.sync_mode_ = sync_mode;
-          info.max_retries_ = max_retries;
-          info.expr_node_ = expr_node;
-          if (OB_FAIL(ddl_stmt->add_ai_column_info(info))) {
+          int64_t pos = 0;
+          if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%.*s",
+                                      static_cast<int32_t>(expr_node->str_len_),
+                                      expr_node->str_value_))) {
+          } else if (column.is_json()
+                     && OB_FAIL(databuff_printf(buf, buf_len, pos, " ; %s", JSON_PROMPT))) {
+          } else if (OB_FAIL(ob_write_string(*allocator_, dep_buf.string(), info.deps_))) {
+          } else if (OB_FAIL(ob_write_string(*allocator_, expr_text_buf.string(),
+                                             info.expr_text_))) {
+          } else {
+            info.column_name_ = column.get_column_name_str();
+            info.normalized_expr_.assign_ptr(buf, static_cast<int32_t>(pos));
+            info.sync_mode_ = sync_mode;
+            info.max_retries_ = max_retries;
+            info.expr_node_ = expr_node;
+            if (OB_FAIL(ddl_stmt->add_ai_column_info(info))) {
+            }
           }
         }
       }
@@ -2163,6 +2313,37 @@ int ObDDLResolver::fill_ai_hidden_column(const ObColumnSchemaV2 &ai_column,
       hidden_column.set_collation_type(CS_TYPE_UTF8MB4_BIN);
       hidden_column.set_data_type(ObVarcharType);
       hidden_column.set_data_length(1024);
+    }
+  }
+  return ret;
+}
+
+// Keep only the names that really are columns of the table and persist them as the
+// comment of the state hidden column of the AI column.
+int ObDDLResolver::fill_ai_column_deps(
+    const ObTableSchema &table_schema,
+    const ObAiColumnStmtInfo &info,
+    ObColumnSchemaV2 &hidden_column)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObString, 8> dep_names;
+  ObSqlString dep_buf;
+  if (info.deps_.empty()) {
+    // no dependency at all, the AI column is only invalidated by primary key changes
+  } else if (OB_FAIL(split_ident_names(info.deps_, dep_names))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < dep_names.count(); ++i) {
+      const ObString &name = dep_names.at(i);
+      if (NULL == table_schema.get_column_schema(name)) {
+        // a function name or something else that is not a real column
+      } else if (OB_FAIL(dep_buf.append_fmt("%s%.*s", dep_buf.empty() ? "" : ",",
+                                            name.length(), name.ptr()))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (dep_buf.empty()) {
+    } else if (OB_FAIL(hidden_column.set_comment(dep_buf.string()))) {
+      SQL_RESV_LOG(WARN, "failed to set ai column deps", K(ret), K(dep_buf));
     }
   }
   return ret;

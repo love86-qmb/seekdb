@@ -532,6 +532,14 @@ protected:
       const share::schema::ObColumnSchemaV2 &ai_column,
       const int64_t hid_idx,
       share::schema::ObColumnSchemaV2 &hidden_column);
+  // Store the comma separated list of the table columns an AI column expression
+  // depends on as the comment of its state hidden column. It costs no schema change
+  // and the update resolver can read it back from the table schema to know when the
+  // AI column has to be invalidated.
+  int fill_ai_column_deps(
+      const share::schema::ObTableSchema &table_schema,
+      const ObAiColumnStmtInfo &info,
+      share::schema::ObColumnSchemaV2 &hidden_column);
   // whether the given name is the name of an AI column of the table being created
   bool is_ai_column_name(const common::ObString &name) const;
   int add_ai_column_name(const common::ObString &name);

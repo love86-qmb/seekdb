@@ -109,6 +109,8 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     // Parse cascading update columns
     if (OB_FAIL(resolve_additional_assignments(tables_assign,
                                                T_UPDATE_SCOPE))) {
+    } else if (OB_FAIL(resolve_ai_column_invalidation(tables_assign))) {
+      SQL_RESV_LOG(WARN, "failed to resolve ai column invalidation", K(ret));
     }
   }
 
@@ -530,6 +532,164 @@ int ObUpdateResolver::resolve_update_constraints()
           if (OB_FAIL(ObTableAssignment::expand_expr(*params_.expr_factory_,
                                                      table_info->assignments_,
                                                      table_info->view_check_exprs_.at(j)))) {
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+namespace {
+// split "name1,name2,..." into separate names
+int split_ai_deps(const ObString &deps, ObIArray<ObString> &names)
+{
+  int ret = OB_SUCCESS;
+  int64_t start = 0;
+  while (OB_SUCC(ret) && start <= deps.length()) {
+    int64_t end = start;
+    while (end < deps.length() && ',' != deps[end]) {
+      ++end;
+    }
+    if (end > start && OB_FAIL(names.push_back(ObString(static_cast<int32_t>(end - start),
+                                                        deps.ptr() + start)))) {
+    }
+    start = end + 1;
+  }
+  return ret;
+}
+}  // namespace
+
+// An AI column holds derived data. When the statement assigns any column its
+// expression depends on, or any primary key column, the stored AI value is stale and
+// has to be recomputed, so the AI column is reset to NULL. Writing NULL is a normal
+// column write, hence a rollback restores the previous value automatically and the
+// statement itself sees the invalidation.
+int ObUpdateResolver::resolve_ai_column_invalidation(
+    ObIArray<ObTableAssignment> &table_assigns)
+{
+  int ret = OB_SUCCESS;
+  ObUpdateStmt *update_stmt = get_update_stmt();
+  if (OB_ISNULL(update_stmt) || OB_ISNULL(schema_checker_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid resolver status", K(ret), K(update_stmt), K_(schema_checker));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_assigns.count(); ++i) {
+    ObTableAssignment &table_assign = table_assigns.at(i);
+    const TableItem *table_item = update_stmt->get_table_item_by_id(table_assign.table_id_);
+    const ObTableSchema *table_schema = NULL;
+    ObSEArray<ObColumnRefRawExpr *, 8> set_columns;
+    if (OB_ISNULL(table_item)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("table item not found", K(ret), K(table_assign.table_id_));
+    } else if (!table_item->is_basic_table()) {
+      // only a plain table can own AI columns
+    } else if (OB_FAIL(schema_checker_->get_table_schema(
+                 table_item->get_base_table_item().ref_id_, table_schema))) {
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < table_assign.assignments_.count(); ++j) {
+        ObColumnRefRawExpr *column_expr = table_assign.assignments_.at(j).column_expr_;
+        if (OB_ISNULL(column_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(set_columns.push_back(column_expr))) {
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(add_ai_column_invalidation(*table_schema, *table_item,
+                                                             table_assigns, set_columns))) {
+        LOG_WARN("failed to add ai column invalidation", K(ret),
+                 K(table_schema->get_table_name_str()));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObUpdateResolver::add_ai_column_invalidation(
+    const ObTableSchema &table_schema,
+    const TableItem &table_item,
+    ObIArray<ObTableAssignment> &table_assigns,
+    const ObIArray<ObColumnRefRawExpr *> &set_columns)
+{
+  int ret = OB_SUCCESS;
+  // a primary key change moves the row, the AI value has to be recomputed as well
+  bool pk_changed = false;
+  for (int64_t i = 0; !pk_changed && OB_SUCC(ret) && i < set_columns.count(); ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema(
+        set_columns.at(i)->get_column_id());
+    if (NULL != column && column->is_rowkey_column()) {
+      pk_changed = true;
+    }
+  }
+  for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+       OB_SUCC(ret) && iter != table_schema.column_end(); ++iter) {
+    const ObColumnSchemaV2 *ai_column = *iter;
+    char state_column_name[OB_MAX_COLUMN_NAME_LENGTH + 32] = {'\0'};
+    int64_t name_pos = 0;
+    const ObColumnSchemaV2 *state_column = NULL;
+    if (OB_ISNULL(ai_column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (ai_column->is_hidden()) {
+      // hidden columns are maintained by the AI column machinery itself
+    } else if (OB_FAIL(databuff_printf(state_column_name, sizeof(state_column_name), name_pos,
+                                       "%.*s_ai_state",
+                                       ai_column->get_column_name_str().length(),
+                                       ai_column->get_column_name_str().ptr()))) {
+    } else if (NULL == (state_column = table_schema.get_column_schema(
+                   ObString(static_cast<int32_t>(name_pos), state_column_name)))) {
+      // not an AI column
+    } else {
+      bool assigned_by_user = false;
+      bool invalidate = pk_changed;
+      ObSEArray<ObString, 8> deps;
+      for (int64_t i = 0; !assigned_by_user && i < set_columns.count(); ++i) {
+        if (set_columns.at(i)->get_column_id() == ai_column->get_column_id()) {
+          // the statement sets the AI column explicitly, leave it alone
+          assigned_by_user = true;
+        }
+      }
+      if (assigned_by_user) {
+      } else if (OB_FAIL(split_ai_deps(state_column->get_comment_str(), deps))) {
+      } else {
+        for (int64_t i = 0; !invalidate && i < deps.count(); ++i) {
+          for (int64_t j = 0; !invalidate && j < set_columns.count(); ++j) {
+            const ObColumnSchemaV2 *set_column = table_schema.get_column_schema(
+                set_columns.at(j)->get_column_id());
+            if (NULL != set_column
+                && 0 == deps.at(i).case_compare(set_column->get_column_name_str())) {
+              invalidate = true;
+            }
+          }
+        }
+        if (OB_SUCC(ret) && invalidate) {
+          ColumnItem *column_item = NULL;
+          if (OB_FAIL(resolve_basic_column_item(table_item, ai_column->get_column_name_str(),
+                                                true, column_item))) {
+          } else if (OB_ISNULL(column_item) || OB_ISNULL(column_item->expr_)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            ObConstRawExpr *null_expr = NULL;
+            ObObj null_value;
+            null_value.set_null();
+            if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_NULL, null_expr))) {
+            } else {
+              null_expr->set_value(null_value);
+              ObRawExpr *value_expr = null_expr;
+              ObAssignment assignment;
+              if (OB_FAIL(value_expr->formalize(session_info_))) {
+              } else if (OB_FAIL(add_additional_function_according_to_type(
+                             column_item, value_expr, T_UPDATE_SCOPE, true))) {
+              } else {
+                assignment.column_expr_ = column_item->expr_;
+                assignment.expr_ = value_expr;
+                if (OB_FAIL(add_assignment(table_assigns, &table_item, column_item,
+                                           assignment))) {
+                  LOG_WARN("failed to add ai column invalidation assignment", K(ret),
+                           K(ai_column->get_column_name_str()));
+                }
+              }
+            }
           }
         }
       }

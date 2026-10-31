@@ -916,6 +916,10 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           ObColumnSchemaV2 hidden_column;
           if (FALSE_IT(hidden_column.set_column_id(gen_column_id()))) {
           } else if (OB_FAIL(fill_ai_hidden_column(*ai_column, hid_idx, hidden_column))) {
+          } else if (0 == hid_idx
+                     && OB_FAIL(fill_ai_column_deps(table_schema,
+                                                    ddl_stmt->get_ai_column_info(i),
+                                                    hidden_column))) {
           } else if (OB_FAIL(table_schema.add_column(hidden_column))) {
             SQL_RESV_LOG(WARN, "failed to add ai hidden column", K(ret), K(hidden_column));
           } else {
