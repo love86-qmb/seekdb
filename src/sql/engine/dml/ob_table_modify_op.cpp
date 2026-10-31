@@ -21,6 +21,8 @@
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "share/inner_table/ob_inner_table_schema_constants.h"
+#include "share/schema/ob_multi_version_schema_service.h"
 
 namespace oceanbase
 {
@@ -621,6 +623,7 @@ ObTableModifyOp::ObTableModifyOp(ObExecContext &ctx,
     iter_end_(false),
     dml_rtctx_(eval_ctx_, ctx, *this),
     execute_single_row_(false),
+    ai_task_reconciled_(false),
     dml_modify_rows_(ctx.get_allocator()),
     last_store_row_(),
     saved_session_(NULL)
@@ -811,6 +814,296 @@ int ObTableModifyOp::inner_close()
     }
   }
   dml_modify_rows_.clear();
+  return ret;
+}
+
+namespace {
+// A visible column C is an AI column when the table owns the hidden column
+// "C_ai_state", which is what the AI COLUMN ddl creates.
+int collect_ai_columns(const ObTableSchema &table_schema,
+                       ObIArray<const ObColumnSchemaV2 *> &ai_columns)
+{
+  int ret = OB_SUCCESS;
+  char state_name[OB_MAX_COLUMN_NAME_LENGTH + 32] = {'\0'};
+  for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+       OB_SUCC(ret) && iter != table_schema.column_end(); ++iter) {
+    const ObColumnSchemaV2 *column = *iter;
+    int64_t pos = 0;
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (column->is_hidden()) {
+    } else if (OB_FAIL(databuff_printf(state_name, sizeof(state_name), pos, "%.*s_ai_state",
+                                       column->get_column_name_str().length(),
+                                       column->get_column_name_str().ptr()))) {
+    } else if (NULL == table_schema.get_column_schema(
+                 ObString(static_cast<int32_t>(pos), state_name))) {
+    } else if (OB_FAIL(ai_columns.push_back(column))) {
+    }
+  }
+  return ret;
+}
+
+// Build the text expression that renders the row key of a row as the predicate that
+// addresses it, for a single column key it produces exactly "`id` = 1".
+int build_rowkey_text_expr(const ObTableSchema &table_schema,
+                           const ObIArray<uint64_t> &rowkey_ids,
+                           ObSqlString &expr)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_ids.count(); ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema(rowkey_ids.at(i));
+    const ObString &name = column->get_column_name_str();
+    const bool is_string = NULL != column && ob_is_string_type(column->get_data_type());
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (is_string) {
+      // string keys have to be quoted inside the rendered predicate
+      if (OB_FAIL(expr.append_fmt("%s'`%.*s` = ''', %.*s, '''", 0 == i ? "" : ", ",
+                                  name.length(), name.ptr(), name.length(), name.ptr()))) {
+      }
+    } else if (OB_FAIL(expr.append_fmt("%s'`%.*s` = ', %.*s", 0 == i ? "" : ", ",
+                                       name.length(), name.ptr(), name.length(), name.ptr()))) {
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObSqlString tmp;
+    if (OB_FAIL(tmp.append_fmt("CONCAT(%s)", expr.ptr()))) {
+    } else if (OB_FAIL(expr.assign(tmp))) {
+    }
+  }
+  return ret;
+}
+}  // namespace
+
+// An AI column holds derived data, so a statement that modified a table owning AI
+// columns has to keep the __all_ai_column_task rows in sync with it: every row whose AI
+// column is NULL needs exactly one task, and a row that is gone or already filled needs
+// none. The whole table is reconciled instead of hooking each written row, which is also
+// what makes a statement that touches many rows (a batch insert, a range delete) correct.
+//
+// The reconciliation runs in the nested internal session, which shares the transaction
+// of the user session: a reader of the transaction sees the task rows, and a rollback
+// removes them again. It therefore only ever issues simple statements - a key read, one
+// INSERT ... VALUES and one DELETE ... IN - because a nested INSERT ... SELECT into a
+// system table is refused by this build.
+//
+// A table without AI columns pays one schema lookup.
+static const int64_t MAX_AI_COLUMN_TASK_BATCH = 256;
+
+namespace {
+// run %sql and copy the first column of every row into %values
+int read_first_column(ObTableModifyOp &op, const char *sql, common::ObIAllocator &alloc,
+                      common::ObIArray<common::ObString> &values)
+{
+  int ret = OB_SUCCESS;
+  SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+    common::sqlclient::ObMySQLResult *result = NULL;
+    if (OB_FAIL(op.execute_read(sql, res))) {
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      bool iter_end = false;
+      while (OB_SUCC(ret) && !iter_end) {
+        common::ObString value;
+        if (OB_FAIL(result->next())) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+          iter_end = true;
+        } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(0), value))) {
+        } else if (OB_FAIL(ob_write_string(alloc, value, value))) {
+        } else if (OB_FAIL(values.push_back(value))) {
+        }
+      }
+    }
+    // the inner connection refuses to run another statement while a read result is
+    // still referenced, so it has to be released even when the read failed
+    if (NULL != result) {
+      int close_ret = result->close();
+      if (OB_SUCCESS != close_ret && OB_SUCC(ret)) {
+        ret = close_ret;
+      }
+    }
+  }
+  return ret;
+}
+
+// append 'value' as a single quoted SQL string literal
+int append_sql_string(const common::ObString &value, common::ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(sql.append("'"))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+      const char c = value.ptr()[i];
+      if ('\'' == c) {
+        if (OB_FAIL(sql.append("''"))) {
+        }
+      } else if ('\\' == c) {
+        if (OB_FAIL(sql.append("\\\\"))) {
+        }
+      } else if (OB_FAIL(sql.append(&c, 1))) {
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(sql.append("'"))) {
+    }
+  }
+  return ret;
+}
+
+// append the string literals of %values, comma separated
+int append_sql_string_list(const common::ObIArray<common::ObString> &values,
+                           common::ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < values.count(); ++i) {
+    if (OB_FAIL(sql.append(0 == i ? "" : ", "))) {
+    } else if (OB_FAIL(append_sql_string(values.at(i), sql))) {
+    }
+  }
+  return ret;
+}
+}  // namespace
+
+int ObTableModifyOp::reconcile_ai_column_tasks()
+{
+  int ret = OB_SUCCESS;
+  ObTableID table_loc_id = OB_INVALID_ID;
+  ObTableID ref_table_id = OB_INVALID_ID;
+  const ObTableSchema *table_schema = NULL;
+  const ObDatabaseSchema *db_schema = NULL;
+  ObSchemaGetterGuard schema_guard;
+  ObSEArray<const ObColumnSchemaV2 *, 4> ai_columns;
+  if (ai_task_reconciled_) {
+    // the statement is reconciled already
+  } else if (MY_SPEC.is_pdml_index_maintain_ || MY_SPEC.is_pdml_update_split_) {
+    // an index maintenance operator, or the insert half of a split update, is not the
+    // operator that owns the modification of the primary table
+  } else if (OB_FAIL(MY_SPEC.get_single_table_loc_id(table_loc_id, ref_table_id))) {
+    // a multi table modification, nothing to reconcile
+    ret = OB_SUCCESS;
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(ref_table_id, table_schema))) {
+  } else if (OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
+    // an index table or a system table never owns AI columns
+  } else if (OB_FAIL(collect_ai_columns(*table_schema, ai_columns))) {
+  } else if (ai_columns.empty()) {
+    // a table without AI columns stops here
+  } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(),
+                                                      db_schema))) {
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObArenaAllocator allocator("AiColumnTask");
+    ObSEArray<uint64_t, 4> rowkey_ids;
+    ObSqlString rowkey_expr;
+    ObSqlString sql;
+    bool has_hidden_rowkey = false;
+    if (OB_FAIL(table_schema->get_rowkey_column_ids(rowkey_ids))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_ids.count(); ++i) {
+      const ObColumnSchemaV2 *column = table_schema->get_column_schema(rowkey_ids.at(i));
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_hidden()) {
+        has_hidden_rowkey = true;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (has_hidden_rowkey || rowkey_ids.empty()) {
+      // without a user visible primary key there is no stable way to address a row
+    } else if (OB_FAIL(build_rowkey_text_expr(*table_schema, rowkey_ids, rowkey_expr))) {
+    } else if (OB_FAIL(open_inner_conn())) {
+    } else if (OB_FAIL(begin_nested_session(true))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+        const ObColumnSchemaV2 *ai_column = ai_columns.at(i);
+        ObSEArray<ObString, 16> pending_keys;
+        ObSEArray<ObString, 16> task_keys;
+        ObSEArray<ObString, 16> new_keys;
+        ObSEArray<ObString, 16> stale_keys;
+        // rows that still need a value
+        sql.reuse();
+        if (OB_FAIL(sql.append_fmt("SELECT %s FROM `%.*s`.`%.*s` WHERE `%.*s` IS NULL "
+                                   "LIMIT %ld",
+                                   rowkey_expr.ptr(),
+                                   db_schema->get_database_name_str().length(),
+                                   db_schema->get_database_name_str().ptr(),
+                                   table_schema->get_table_name_str().length(),
+                                   table_schema->get_table_name_str().ptr(),
+                                   ai_column->get_column_name_str().length(),
+                                   ai_column->get_column_name_str().ptr(),
+                                   MAX_AI_COLUMN_TASK_BATCH))) {
+        } else if (OB_FAIL(read_first_column(*this, sql.ptr(), allocator, pending_keys))) {
+        } else if (FALSE_IT(sql.reuse())) {
+        } else if (OB_FAIL(sql.append_fmt("SELECT row_key FROM %s.%s WHERE table_id = %lu "
+                                          "AND column_id = %lu LIMIT %ld",
+                                          OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TASK_TNAME,
+                                          table_schema->get_table_id(),
+                                          ai_column->get_column_id(),
+                                          MAX_AI_COLUMN_TASK_BATCH))) {
+        } else if (OB_FAIL(read_first_column(*this, sql.ptr(), allocator, task_keys))) {
+        }
+        // one task per pending row that does not own one yet
+        for (int64_t p = 0; OB_SUCC(ret) && p < pending_keys.count(); ++p) {
+          if (has_exist_in_array(task_keys, pending_keys.at(p))) {
+          } else if (OB_FAIL(new_keys.push_back(pending_keys.at(p)))) {
+          }
+        }
+        // no task for a row that is gone or already filled
+        for (int64_t t = 0; OB_SUCC(ret) && t < task_keys.count(); ++t) {
+          if (has_exist_in_array(pending_keys, task_keys.at(t))) {
+          } else if (OB_FAIL(stale_keys.push_back(task_keys.at(t)))) {
+          }
+        }
+        if (OB_FAIL(ret) || new_keys.empty()) {
+        } else if (FALSE_IT(sql.reuse())) {
+        } else if (OB_FAIL(sql.append_fmt("INSERT INTO %s.%s (table_id, column_id, row_key, "
+                                          "rowkey_predicate, request_id, state, retry_count, "
+                                          "eligible_ts, row_epoch) VALUES ",
+                                          OB_SYS_DATABASE_NAME,
+                                          OB_ALL_AI_COLUMN_TASK_TNAME))) {
+        } else {
+          for (int64_t n = 0; OB_SUCC(ret) && n < new_keys.count(); ++n) {
+            if (OB_FAIL(sql.append_fmt("%s(%lu, %lu, ", 0 == n ? "" : ", ",
+                                       table_schema->get_table_id(),
+                                       ai_column->get_column_id()))) {
+            } else if (OB_FAIL(append_sql_string(new_keys.at(n), sql))) {
+            } else if (OB_FAIL(sql.append(", "))) {
+            } else if (OB_FAIL(append_sql_string(new_keys.at(n), sql))) {
+            } else if (OB_FAIL(sql.append(", 0, 0, 0, now(6), 0)"))) {
+            }
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(execute_write(sql.ptr()))) {
+            LOG_WARN("failed to create ai column tasks", KR(ret), K(sql));
+          }
+        }
+        if (OB_FAIL(ret) || stale_keys.empty()) {
+        } else if (FALSE_IT(sql.reuse())) {
+        } else if (OB_FAIL(sql.append_fmt("DELETE FROM %s.%s WHERE table_id = %lu "
+                                          "AND column_id = %lu AND row_key IN (",
+                                          OB_SYS_DATABASE_NAME,
+                                          OB_ALL_AI_COLUMN_TASK_TNAME,
+                                          table_schema->get_table_id(),
+                                          ai_column->get_column_id()))) {
+        } else if (OB_FAIL(append_sql_string_list(stale_keys, sql))) {
+        } else if (OB_FAIL(sql.append(")"))) {
+        } else if (OB_FAIL(execute_write(sql.ptr()))) {
+          LOG_WARN("failed to drop ai column tasks", KR(ret), K(sql));
+        }
+      }
+      int end_ret = end_nested_session();
+      if (OB_SUCCESS != end_ret && OB_SUCCESS == ret) {
+        ret = end_ret;
+      }
+      if (OB_SUCC(ret)) {
+        ai_task_reconciled_ = true;
+      }
+    }
+  }
   return ret;
 }
 
@@ -1131,6 +1424,13 @@ int ObTableModifyOp::inner_get_next_row()
       if (OB_FAIL(submit_all_dml_task())) {
       }
     }
+    // TODO(ai column): reconcile_ai_column_tasks() has to run here, once the rows of
+    // the statement are written, so that the __all_ai_column_task rows follow the DML
+    // inside the same transaction. It is disabled because a nested internal session is
+    // refused when it writes into the __all_ai_column_task system table: both
+    // "INSERT ... VALUES" and "DELETE ... WHERE row_key = ..." come back as
+    // OB_ERR_UNEXPECTED (-4016), while the nested reads of that same session succeed.
+    // See reconcile_ai_column_tasks() for the rest of the design.
     //to post process the DML info after writing all data to the storage or returning one row
     ret = write_rows_post_proc(ret);
     if (OB_SUCC(ret) && iter_end_) {

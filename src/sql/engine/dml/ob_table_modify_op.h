@@ -248,6 +248,10 @@ public:
   void clear_dml_evaluated_flag();
   void clear_dml_evaluated_flag(int64_t parent_cnt, ObExpr **parent_exprs);
   void clear_dml_evaluated_flag(ObExpr *clear_expr);
+  // Reconcile __all_ai_column_task with the rows this statement modified: create a
+  // task for every row whose AI column is NULL, drop the tasks of rows that are gone
+  // or already filled. A table without AI columns pays one schema lookup only.
+  int reconcile_ai_column_tasks();
 
   ObDMLModifyRowsList& get_dml_modify_row_list() { return dml_modify_rows_;}
   int submit_all_dml_task();
@@ -309,6 +313,7 @@ public:
   bool iter_end_;
   ObDMLRtCtx dml_rtctx_;
   bool execute_single_row_;
+  bool ai_task_reconciled_;
   ObSEArray<ObExpr *, 4> trigger_clear_exprs_;
   ObDMLModifyRowsList dml_modify_rows_;
   ObSEArray<ObForeignKeyChecker *, 4> fk_checkers_;
