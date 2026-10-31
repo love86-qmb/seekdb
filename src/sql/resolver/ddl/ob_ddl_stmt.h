@@ -25,16 +25,41 @@ namespace oceanbase
 {
 namespace sql
 {
+// Describes one "AI COLUMN" clause resolved from a column definition. It is carried by
+// the DDL statement from the resolver to the executor, which persists the metadata rows
+// into __all_ai_column once the DDL itself has succeeded.
+struct ObAiColumnStmtInfo
+{
+public:
+  ObAiColumnStmtInfo() : max_retries_(-1), expr_node_(NULL) {}
+  void reset()
+  {
+    column_name_.reset();
+    normalized_expr_.reset();
+    sync_mode_.reset();
+    max_retries_ = -1;
+    expr_node_ = NULL;
+  }
+  common::ObString column_name_;
+  common::ObString normalized_expr_;
+  common::ObString sync_mode_;
+  int64_t max_retries_;
+  // the resolved expression parse node, only used inside the resolver
+  const void *expr_node_;
+};
+
 class ObDDLStmt : public ObStmt, public ObICmd
 {
   const static int OB_DEFAULT_ARRAY_SIZE = 16;
 public:
+  static const int64_t MAX_AI_COLUMN_COUNT = 16;
+public:
   ObDDLStmt(common::ObIAllocator *name_pool, stmt::StmtType type)
-      : ObStmt(name_pool, type), parallelism_(1L), has_parallel_hint_(false)
+      : ObStmt(name_pool, type), parallelism_(1L), has_parallel_hint_(false), ai_column_count_(0)
   {
   }
   explicit ObDDLStmt(stmt::StmtType type)
-      : ObStmt(type), parallelism_(1L), has_parallel_hint_(false)
+      : ObStmt(type), parallelism_(1L), has_parallel_hint_(false), ai_column_count_(0)
   {
   }
   virtual ~ObDDLStmt() {}
@@ -54,11 +79,29 @@ public:
   int64_t &get_parallelism() { return parallelism_; }
   void set_has_parallel_hint(bool has_parallel_hint) { has_parallel_hint_ = has_parallel_hint; }
   bool get_has_parallel_hint() const { return has_parallel_hint_; }
+  int add_ai_column_info(const ObAiColumnStmtInfo &info)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_UNLIKELY(ai_column_count_ < 0 || ai_column_count_ >= MAX_AI_COLUMN_COUNT)) {
+      ret = OB_SIZE_OVERFLOW;
+      COMMON_LOG(WARN, "too many ai columns", KR(ret), K(ai_column_count_));
+    } else {
+      ai_column_infos_[ai_column_count_++] = info;
+    }
+    return ret;
+  }
+  int64_t get_ai_column_count() const { return ai_column_count_; }
+  const ObAiColumnStmtInfo &get_ai_column_info(const int64_t idx) const
+  {
+    return ai_column_infos_[idx];
+  }
 protected:
   ObArenaAllocator allocator_;
 private:
   int64_t parallelism_;
   bool has_parallel_hint_;
+  ObAiColumnStmtInfo ai_column_infos_[MAX_AI_COLUMN_COUNT];
+  int64_t ai_column_count_;
 
   DISALLOW_COPY_AND_ASSIGN(ObDDLStmt);
 };

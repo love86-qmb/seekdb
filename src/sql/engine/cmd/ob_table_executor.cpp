@@ -42,6 +42,10 @@
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
+#include "share/inner_table/ob_inner_table_schema_constants.h"
+#include "share/ob_dml_sql_splicer.h"
+#include "share/ob_share_util.h"
+#include "common/object/ob_object.h"
 namespace oceanbase
 {
 using namespace common;
@@ -50,6 +54,239 @@ using namespace share::schema;
 using namespace observer;
 namespace sql
 {
+
+namespace {
+// suffixes of the three hidden columns owned by every AI column, keep in sync
+// with ObDDLResolver::fill_ai_hidden_column
+const char *AI_HIDDEN_COLUMN_SUFFIX[] = {"_ai_state", "_ai_request", "_ai_result_spec"};
+
+// Find the column id of every column of one table from __all_column, the AI column
+// metadata rows must reference the column ids the DDL finally persisted.
+int fetch_table_column_ids(const uint64_t table_id,
+                           common::ObIAllocator &allocator,
+                           common::ObIArray<common::ObString> &names,
+                           common::ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  ObTimeoutCtx ctx;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(ctx, config::internal_sql_execute_timeout()))) {
+  } else if (OB_FAIL(sql.assign_fmt("SELECT column_name, column_id FROM %s WHERE table_id = %lu",
+                                    OB_ALL_COLUMN_TNAME, table_id))) {
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+        LOG_WARN("failed to read all column", KR(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        int tmp_ret = OB_SUCCESS;
+        while (OB_SUCC(ret)) {
+          ObString column_name;
+          uint64_t column_id = OB_INVALID_ID;
+          ObString stored_name;
+          if (OB_ITER_END == (tmp_ret = result->next())) {
+            break;
+          } else if (OB_SUCCESS != tmp_ret) {
+            ret = tmp_ret;
+            LOG_WARN("failed to fetch next all column row", KR(ret));
+          }
+          EXTRACT_VARCHAR_FIELD_MYSQL(*result, "column_name", column_name);
+          EXTRACT_INT_FIELD_MYSQL(*result, "column_id", column_id, uint64_t);
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(ob_write_string(allocator, column_name, stored_name))) {
+          } else if (OB_FAIL(names.push_back(stored_name))) {
+          } else if (OB_FAIL(column_ids.push_back(column_id))) {
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+uint64_t find_column_id(const common::ObIArray<common::ObString> &names,
+                        const common::ObIArray<uint64_t> &column_ids,
+                        const common::ObString &name)
+{
+  uint64_t column_id = OB_INVALID_ID;
+  for (int64_t i = 0; OB_INVALID_ID == column_id && i < names.count(); ++i) {
+    if (names.at(i) == name) {
+      column_id = column_ids.at(i);
+    }
+  }
+  return column_id;
+}
+
+// Append one metadata row of an AI column into the DML splicer.
+int add_ai_column_row(ObDMLSqlSplicer &dml,
+                      const uint64_t table_id,
+                      const uint64_t column_id,
+                      const ObAiColumnStmtInfo &info,
+                      const ObIArray<ObString> &names,
+                      const ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  char hid_name_buf[OB_MAX_COLUMN_NAME_LENGTH + 32] = {'\0'};
+  uint64_t hid_column_id[3] = {OB_INVALID_ID, OB_INVALID_ID, OB_INVALID_ID};
+  for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+    int64_t pos = 0;
+    if (OB_FAIL(databuff_printf(hid_name_buf, sizeof(hid_name_buf), pos, "%.*s%s",
+                                info.column_name_.length(), info.column_name_.ptr(),
+                                AI_HIDDEN_COLUMN_SUFFIX[i]))) {
+    } else {
+      hid_column_id[i] = find_column_id(names, column_ids,
+                                        ObString(static_cast<int32_t>(pos), hid_name_buf));
+      if (OB_INVALID_ID == hid_column_id[i]) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai hidden column not found", KR(ret), KCSTRING(hid_name_buf),
+                 K(info.column_name_), K(names));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(dml.add_pk_column("table_id", table_id))) {
+    } else if (OB_FAIL(dml.add_pk_column("column_id", column_id))) {
+    } else if (OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(info.column_name_)))) {
+    } else if (OB_FAIL(dml.add_column("state_column_id", hid_column_id[0]))) {
+    } else if (OB_FAIL(dml.add_column("request_column_id", hid_column_id[1]))) {
+    } else if (OB_FAIL(dml.add_column("result_spec_column_id", hid_column_id[2]))) {
+    } else if (OB_FAIL(dml.add_column("expr_text", ObHexEscapeSqlStr(info.normalized_expr_)))) {
+    } else if (OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(info.normalized_expr_)))) {
+    } else if (OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(info.sync_mode_)))) {
+    } else if (OB_FAIL(dml.add_column("max_retries", info.max_retries_))) {
+    } else if (OB_FAIL(dml.add_gmt_create()) || OB_FAIL(dml.add_gmt_modified())) {
+    }
+  }
+  return ret;
+}
+
+// Persist one __all_ai_column row for every AI column carried by the DDL statement.
+// The schema rows of the new table/column are read back from __all_column, they may
+// not be visible yet right after the DDL returns, so OB_EAGAIN is retried.
+int persist_ai_columns_once(const uint64_t table_id, const ObDDLStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("AiColumnMeta");
+  ObSEArray<ObString, 32> names;
+  ObSEArray<uint64_t, 32> column_ids;
+  if (OB_UNLIKELY(OB_INVALID_ID == table_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid table id for ai column", KR(ret), K(table_id));
+  } else if (OB_FAIL(fetch_table_column_ids(table_id, allocator, names, column_ids))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt.get_ai_column_count(); ++i) {
+      const ObAiColumnStmtInfo &info = stmt.get_ai_column_info(i);
+      const uint64_t column_id = find_column_id(names, column_ids, info.column_name_);
+      ObSqlString buffer;
+      ObDMLSqlSplicer dml;
+      int64_t affected_rows = 0;
+      if (OB_INVALID_ID == column_id) {
+        ret = OB_EAGAIN;
+        LOG_WARN("ai column not found in all column, will retry", KR(ret),
+                 K(info.column_name_), K(names));
+      } else if (OB_FAIL(add_ai_column_row(dml, table_id, column_id, info, names, column_ids))) {
+        if (OB_ERR_UNEXPECTED == ret) {
+          // one of the hidden columns is not visible yet
+          ret = OB_EAGAIN;
+        }
+      } else if (OB_FAIL(dml.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+      } else if (OB_FAIL(GCTX.sql_proxy_->write(buffer.ptr(), affected_rows))) {
+        LOG_WARN("failed to write ai column row", KR(ret), K(buffer));
+      } else if (1 != affected_rows) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
+  }
+  return ret;
+}
+
+int persist_ai_columns(const uint64_t table_id, const ObDDLStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  const int64_t MAX_RETRY = 20;
+  int64_t retry = 0;
+  do {
+    ret = persist_ai_columns_once(table_id, stmt);
+    if (OB_EAGAIN == ret) {
+      usleep(100 * 1000);  // 100ms
+    }
+  } while (OB_EAGAIN == ret && ++retry < MAX_RETRY);
+  if (OB_EAGAIN == ret) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column metadata is still not visible", KR(ret), K(table_id));
+  }
+  return ret;
+}
+
+// Drop the AI column metadata rows of a table that is being dropped.
+int delete_ai_columns(const uint64_t table_id)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  ObTimeoutCtx ctx;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(ctx, config::internal_sql_execute_timeout()))) {
+  } else if (OB_FAIL(sql.assign_fmt("DELETE FROM %s WHERE table_id = %lu",
+                                    OB_ALL_AI_COLUMN_TNAME, table_id))) {
+  } else if (OB_FAIL(GCTX.sql_proxy_->write(sql.ptr(), affected_rows))) {
+    LOG_WARN("failed to delete ai column rows", KR(ret), K(sql));
+  }
+  return ret;
+}
+
+// Collect the ids of the tables being dropped before they disappear from the schema,
+// best effort: a failed lookup never fails the drop itself.
+int collect_ai_column_table_ids(ObExecContext &ctx,
+                                const obcall::ObDropTableArg &arg,
+                                common::ObIArray<uint64_t> &table_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  ObSQLSessionInfo *session = ctx.get_my_session();
+  if (OB_ISNULL(GCTX.schema_service_) || OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+    LOG_WARN("failed to get schema guard", KR(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < arg.tables_.count(); ++i) {
+      const obcall::ObTableItem &item = arg.tables_.at(i);
+      uint64_t table_id = item.table_id_;
+      if (OB_INVALID_ID == table_id) {
+        ObString db_name = item.database_name_;
+        if (db_name.empty()) {
+          db_name = session->get_database_name();
+        }
+        int tmp_ret = OB_SUCCESS;
+        if (OB_SUCCESS != (tmp_ret = schema_guard.get_table_id(db_name, item.table_name_,
+                                                               item.is_hidden_,
+                                                               ObSchemaGetterGuard::ALL_NON_HIDDEN_TYPES,
+                                                               table_id))) {
+          // the item may be an index table instead of a normal table
+          if (OB_SUCCESS != (tmp_ret = schema_guard.get_table_id(db_name, item.table_name_,
+                                                                 !item.is_hidden_,
+                                                                 ObSchemaGetterGuard::ALL_NON_HIDDEN_TYPES,
+                                                                 table_id))) {
+            LOG_INFO("failed to get the id of the dropped table", K(tmp_ret), K(item));
+            table_id = OB_INVALID_ID;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && OB_INVALID_ID != table_id) {
+        if (OB_FAIL(table_ids.push_back(table_id))) {
+          LOG_WARN("failed to push back dropped table id", KR(ret), K(table_id));
+        }
+      }
+    }
+  }
+  return ret;
+}
+}  // namespace
 
 ObCreateTableExecutor::ObCreateTableExecutor()
 {
@@ -486,6 +723,11 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
         if (OB_FAIL(ObDDLExecutorUtil::execute_pcreate_table(
             my_session, ctx.root_command_service(), "[parallel create table]",
                                                           create_table_arg, res))) {
+        } else if (stmt.get_ai_column_count() > 0
+                   && OB_FAIL(persist_ai_columns(res.table_id_, stmt))) {
+          // the table has been created, publish the AI column metadata rows
+          LOG_WARN("failed to persist ai column metadata", KR(ret), K(res.table_id_),
+                   K(stmt.get_ai_column_count()));
         }
       }
     } else {
@@ -867,10 +1109,19 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
         }
       }
     }
+    if (OB_SUCC(ret) && stmt.get_ai_column_count() > 0) {
+      // an AI column has been added by this alter table, publish its metadata row
+      uint64_t table_id = alter_table_arg.table_id_;
+      if (OB_INVALID_ID == table_id) {
+        table_id = alter_table_arg.alter_table_schema_.get_table_id();
+      }
+      if (OB_FAIL(persist_ai_columns(table_id, stmt))) {
+        LOG_WARN("failed to persist ai column metadata", KR(ret), K(table_id));
+      }
+    }
     char table_info_buffer[256];
     snprintf(table_info_buffer, sizeof(table_info_buffer), "table_id:%ld, hidden_table_id:%ld", 
               alter_table_arg.table_id_, alter_table_arg.hidden_table_id_);
-
     SERVER_EVENT_ADD("ddl", "alter table execute finish",
       "ret", ret,
       "trace_id", *ObCurTraceId::get_trace_id(),
@@ -1532,6 +1783,7 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
   ObString first_stmt;
   ObSQLSessionInfo *my_session = NULL;
   int64_t foreign_key_checks = 0;
+  ObSEArray<uint64_t, 4> dropped_ai_table_ids;
   
   const ObTableType table_type = drop_table_arg.table_type_;
   if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
@@ -1549,6 +1801,8 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
       //impossible
     } else if (FALSE_IT(my_session->get_foreign_key_checks(foreign_key_checks))) {
     } else if (FALSE_IT(tmp_arg.foreign_key_checks_ = foreign_key_checks)) {
+    } else if (OB_FAIL(collect_ai_column_table_ids(ctx, drop_table_arg, dropped_ai_table_ids))) {
+      LOG_WARN("failed to collect table ids for ai column cleanup", KR(ret));
     } else {
       bool is_parallel_drop = false;
       if (!ObSchemaUtils::is_support_parallel_drop(table_type)) {
@@ -1605,6 +1859,16 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
     }    
   }
 
+  // drop the AI column metadata rows of the dropped tables, the affected table ids
+  // have to be collected before the tables disappear from the schema
+  if (OB_SUCC(ret) && !dropped_ai_table_ids.empty()) {
+    for (int64_t i = 0; i < dropped_ai_table_ids.count(); ++i) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_SUCCESS != (tmp_ret = delete_ai_columns(dropped_ai_table_ids.at(i)))) {
+        LOG_WARN("failed to drop ai column metadata", K(tmp_ret), K(dropped_ai_table_ids.at(i)));
+      }
+    }
+  }
   return ret;
 }
 

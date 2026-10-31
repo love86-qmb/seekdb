@@ -663,6 +663,11 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         }
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(resolve_column_name(column, element))) {
+        } else if (COLUMN_DEFINITION_AI_NUM_CHILD == element->num_child_
+                   && NULL != element->children_[COLUMN_DEFINITION_AI_NUM_CHILD - 1]
+                   && OB_FAIL(add_ai_column_name(column.get_column_name_str()))) {
+          // remember every AI column name, so that an AI column referring to
+          // another AI column can be rejected while resolving the column definitions
         } else {
           OZ (resolved_cols.push_back(column));
         }
@@ -891,6 +896,32 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         } else {
           ObColumnNameHashWrapper name_key(hidden_col.get_column_name_str());
           if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
+          }
+        }
+      }
+    }
+
+    // Every AI column owns three hidden columns: the background task state, the
+    // model request payload and the result specification.
+    if (OB_SUCC(ret) && RESOLVE_NON_COL != resolve_rule) {
+      ObDDLStmt *ddl_stmt = static_cast<ObDDLStmt *>(stmt_);
+      for (int64_t i = 0; OB_SUCC(ret) && i < ddl_stmt->get_ai_column_count(); ++i) {
+        const ObString &ai_column_name = ddl_stmt->get_ai_column_info(i).column_name_;
+        const ObColumnSchemaV2 *ai_column = table_schema.get_column_schema(ai_column_name);
+        if (OB_ISNULL(ai_column)) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "ai column not found in table schema", K(ret), K(ai_column_name));
+        }
+        for (int64_t hid_idx = 0; OB_SUCC(ret) && hid_idx < 3; ++hid_idx) {
+          ObColumnSchemaV2 hidden_column;
+          if (FALSE_IT(hidden_column.set_column_id(gen_column_id()))) {
+          } else if (OB_FAIL(fill_ai_hidden_column(*ai_column, hid_idx, hidden_column))) {
+          } else if (OB_FAIL(table_schema.add_column(hidden_column))) {
+            SQL_RESV_LOG(WARN, "failed to add ai hidden column", K(ret), K(hidden_column));
+          } else {
+            ObColumnNameHashWrapper name_key(hidden_column.get_column_name_str());
+            if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
+            }
           }
         }
       }

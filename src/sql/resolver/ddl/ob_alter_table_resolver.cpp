@@ -3415,6 +3415,7 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         stat.reset();
         bool is_modify_column_visibility = false;
         ObSEArray<ObColumnSchemaV2 *, 8> resolved_cols;
+        const int64_t ai_column_cnt_before = alter_table_stmt->get_ai_column_count();
         if (OB_FAIL(get_table_schema_all_column_schema(resolved_cols, alter_table_stmt->get_alter_table_schema()))) {
         } else if (OB_FAIL(resolve_alter_table_column_definition(alter_column_schema,
                                                           node.children_[i],
@@ -3457,6 +3458,17 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (alter_table_stmt->get_ai_column_count() > ai_column_cnt_before) {
+            // an AI column is added, add the three hidden columns it owns right
+            // after it so that they get consecutive column ids
+            for (int64_t hid_idx = 0; OB_SUCC(ret) && hid_idx < 3; ++hid_idx) {
+              AlterColumnSchema hidden_column;
+              hidden_column.reset();
+              hidden_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              if (OB_FAIL(fill_ai_hidden_column(alter_column_schema, hid_idx, hidden_column))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(hidden_column))) {
+              }
+            }
           }
         }
       }

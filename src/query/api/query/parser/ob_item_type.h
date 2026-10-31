@@ -1067,6 +1067,8 @@ typedef enum ObItemType
   T_TABLE_ELEMENT_LIST = 3362,
   T_TABLE_OPTION_LIST = 3363,
   T_PRIMARY_KEY = 3364,
+  // AI COLUMN clause of a column definition, used by "c1 int AI COLUMN (func(...)) WITH (...)"
+  T_AI_COLUMN = 3365,
   T_COLUMN_DEFINITION = 3366,
   T_COLUMN_ATTRIBUTES = 3367,
   T_CONSTR_NOT_NULL = 3368,
@@ -1086,7 +1088,11 @@ typedef enum ObItemType
   T_IF_NOT_EXISTS = 3382,
   T_IF_EXISTS = 3383,
   T_JOIN_INFO = 3384,
+  // option list of the "WITH (...)" part of an AI COLUMN clause, and one key/value option
+  T_AI_COLUMN_OPTION_LIST = 3385,
   T_TABLET_MAX_SIZE = 3386,
+  // one key/value option inside the WITH (...) part of an AI COLUMN clause
+  T_AI_COLUMN_OPTION = 3388,
   T_BLOCK_SIZE = 3387,
   T_TABLET_ID = 3391,
   T_LS_TABLET = 3393,

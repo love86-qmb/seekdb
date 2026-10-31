@@ -57,6 +57,8 @@ enum NUMCHILD {
   CREATE_TABLE_NUM_CHILD = 8,
   CREATE_TABLE_AS_SEL_NUM_CHILD = 11,
   COLUMN_DEFINITION_NUM_CHILD = 4,
+  // the plain column definition followed by an "AI COLUMN (...)" clause
+  COLUMN_DEFINITION_AI_NUM_CHILD = 5,
   COLUMN_DEF_NUM_CHILD = 3,
   INDEX_NUM_CHILD = 5,
   GEN_COLUMN_DEFINITION_NUM_CHILD = 7
@@ -518,6 +520,21 @@ protected:
       const bool unused_flag = false,
       const bool is_create_table_as = false,
       const bool allow_has_default = true);
+  // ---------- AI COLUMN support ----------
+  // resolve the "AI COLUMN (expr) WITH (...)" clause attached to a column definition
+  int resolve_ai_column_clause(
+      share::schema::ObColumnSchemaV2 &column,
+      const ParseNode *type_node,
+      ParseNode *ai_node);
+  // fill one of the three hidden columns owned by an AI column,
+  // hid_idx: 0 -> state column, 1 -> request column, 2 -> result spec column
+  int fill_ai_hidden_column(
+      const share::schema::ObColumnSchemaV2 &ai_column,
+      const int64_t hid_idx,
+      share::schema::ObColumnSchemaV2 &hidden_column);
+  // whether the given name is the name of an AI column of the table being created
+  bool is_ai_column_name(const common::ObString &name) const;
+  int add_ai_column_name(const common::ObString &name);
   int drop_not_null_constraint(const share::schema::ObColumnSchemaV2 &column);
   int resolve_normal_column_attribute_constr_not_null(ObColumnSchemaV2 &column,
                                                       ParseNode *attrs_node,
@@ -859,6 +876,9 @@ protected:
   common::ObArray<common::ObString> store_column_names_;
   common::ObArray<common::ObString> hidden_store_column_names_;
   common::ObSEArray<share::schema::ObColumnNameWrapper, 16, common::ModulePageAllocator, true> sort_column_array_;
+  // names of the AI columns of the table being created, used to reject an AI column
+  // whose expression refers to another AI column
+  common::ObSEArray<common::ObString, 8, common::ModulePageAllocator, true> ai_column_names_;
   common::hash::ObPlacementHashSet<share::schema::ObColumnNameHashWrapper,
                                    common::OB_MAX_COLUMN_NUMBER> storing_column_set_;
   common::hash::ObPlacementHashSet<share::schema::ObForeignKeyNameHashWrapper,

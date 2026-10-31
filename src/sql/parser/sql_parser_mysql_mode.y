@@ -394,6 +394,7 @@ END_P SET_VAR DELIMITER
 %type <node> update_asgn_list update_asgn_factor
 %type <node> update_basic_stmt delete_basic_stmt
 %type <node> table_element_list table_element column_definition column_definition_ref column_definition_list column_name_list
+%type <node> opt_ai_column_clause ai_column_with_option_list ai_column_option_list ai_column_option
 %type <node> opt_generated_keyname opt_generated_option_list opt_generated_column_attribute_list generated_column_attribute opt_storage_type
 %type <node> data_type special_table_type opt_if_not_exists opt_if_exists opt_charset collation opt_collation cast_data_type
 %type <node> replace_with_opt_hint insert_with_opt_hint column_list opt_on_duplicate_key_clause opt_into opt_replace opt_temporary no_param_column_ref
@@ -4832,13 +4833,13 @@ SIMPLE { $$[0] = T_SIMPLE; }
 ;
 
 column_definition:
-column_definition_ref data_type opt_column_attribute_list opt_column_reference opt_position_column
+column_definition_ref data_type opt_column_attribute_list opt_column_reference opt_position_column opt_ai_column_clause
 {
   (void)($4);
   ParseNode *attributes = NULL;
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, $3);
   set_data_type_collation($2, attributes, false, true);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, $2, attributes, $5);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 5, $1, $2, attributes, $5, $6);
 }
 | column_definition_ref data_type opt_collation opt_generated_keyname AS '(' expr ')' opt_storage_type opt_generated_column_attribute_list opt_column_reference opt_position_column
 {
@@ -4874,6 +4875,51 @@ column_definition_ref data_type opt_column_attribute_list opt_column_reference o
   malloc_non_terminal_node(attributes, result->malloc_pool_, T_LINK_NODE, 2, attributes, unique_attr);
   merge_nodes(attributes, result, T_COLUMN_ATTRIBUTES, attributes);
   malloc_non_terminal_node($$, result->malloc_pool_, T_COLUMN_DEFINITION, 4, $1, unsigned_bigint_type, attributes, $4);
+}
+;
+
+opt_ai_column_clause:
+/*EMPTY*/
+{
+  $$ = NULL;
+}
+| AI COLUMN '(' expr ')' ai_column_with_option_list
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN, 2, $4, $6);
+}
+;
+
+ai_column_with_option_list:
+/*EMPTY*/
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  merge_nodes($$, result, T_AI_COLUMN_OPTION_LIST, $3);
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+column_name COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 1, $3);
+  if (NULL != $$ && NULL != $1) {
+    $$->str_value_ = $1->str_value_;
+    $$->str_len_ = $1->str_len_;
+  }
 }
 ;
 
