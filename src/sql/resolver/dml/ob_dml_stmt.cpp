@@ -192,6 +192,10 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   } else if (OB_FAIL(expr_copier.copy(other.function_table_expr_, function_table_expr_))) {
   } else if (OB_FAIL(part_ids_.assign(other.part_ids_))) {
   } else if (OB_FAIL(part_names_.assign(other.part_names_))) {
+  } else if (is_file_sql_table()) {
+    // The definition holds no raw expressions, so copying the pointer is
+    // enough: it lives in the statement allocator of the original item.
+    file_sql_table_def_ = other.file_sql_table_def_;
   } else if (is_values_table() &&
              OB_FAIL(deep_copy_values_table_def(*other.values_table_def_, expr_copier, allocator))) {
   } else { /* do nothing */ }

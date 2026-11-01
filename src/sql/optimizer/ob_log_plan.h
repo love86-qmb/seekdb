@@ -86,6 +86,7 @@ class ObExchangeInfo;
 class ObDmlTableInfo;
 struct IndexDMLInfo;
 class ValuesTablePath;
+class FileSqlTablePath;
 class ObSelectLogPlan;
 class ObThreeStageAggrInfo;
 struct ObTextRetrievalInfo;
@@ -579,6 +580,8 @@ public:
   int allocate_values_table_path(ValuesTablePath *values_table_path,
                                  ObLogicalOperator *&out_access_path_op);
 
+  int allocate_file_sql_table_path(FileSqlTablePath *file_sql_table_path,
+                                   ObLogicalOperator *&out_access_path_op);
   int allocate_json_table_path(JsonTablePath *json_table_path,
                                    ObLogicalOperator *&out_access_path_op);
 

@@ -1659,6 +1659,13 @@ int ObSelectResolver::expand_target_list(
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(append(column_items, get_stmt()->get_column_items()))) {
     }
+  } else if (table_item.is_file_sql_table()) {
+    // A file table has no schema object; its columns are the column items the
+    // resolver created from the inferred schema.
+    if (OB_ISNULL(get_stmt())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(get_stmt()->get_column_items(table_item.table_id_, column_items))) {
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
   }

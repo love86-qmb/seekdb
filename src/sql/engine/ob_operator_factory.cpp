@@ -70,6 +70,8 @@
 #include "sql/optimizer/ob_log_temp_table_insert.h"
 #include "sql/optimizer/ob_log_temp_table_transformation.h"
 #include "sql/optimizer/ob_log_stat_collector.h"
+#include "sql/optimizer/ob_log_file_sql_table.h"
+#include "sql/engine/basic/ob_file_sql_table_op.h"
 #include "sql/optimizer/ob_log_expand.h"
 #include "sql/engine/aggregate/ob_merge_distinct_op.h"
 #include "sql/engine/aggregate/ob_hash_distinct_op.h"

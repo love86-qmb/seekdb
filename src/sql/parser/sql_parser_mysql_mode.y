@@ -40,18 +40,27 @@
 #include "../../../src/sql/parser/sql_parser_mysql_mode_lex.h"
 #include "../../../src/sql/parser/sql_parser_base.h"
 
-#define GEN_EXPLAN_STMT(no_use, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
-  (void)(no_use); \
+// The first argument is the explain_or_desc marker: it is not null when the
+// statement was written with DESCRIBE/DESC.  Such a statement describes the
+// schema of the inner statement instead of explaining it, and it marks that
+// with a T_BOOL node in the format slot.
+#define GEN_EXPLAN_STMT(describe_marker, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
+  const bool is_describe_stmt = (NULL != (describe_marker)); \
   ParseNode *type_node = NULL; \
   ParseNode *display_node = NULL; \
   if (0 != explain_type) { \
     malloc_terminal_node(type_node, result->malloc_pool_, explain_type); \
   } \
+  if (is_describe_stmt) { \
+    malloc_terminal_node(type_node, result->malloc_pool_, T_BOOL); \
+  } \
   if (0 != display_type) { \
     malloc_terminal_node(display_node, result->malloc_pool_, display_type); \
   } \
   malloc_non_terminal_node(explain_stmt, result->malloc_pool_, T_EXPLAIN, 5, \
-                           type_node, display_node, into_table, set_statement_id, stmt);
+                           type_node, display_node, into_table, set_statement_id, stmt); \
+  /* value_ stays INT64_MAX: question_mark_issue() checks it and stores the */
+  /* number of '?' parameters there afterwards. */
 %}
 
 %destructor {destroy_tree($$);}<node>
@@ -499,6 +508,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_sql_table_expr file_sql_arg_list
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10894,6 +10904,42 @@ tbl_name
 {
   $$ = $1;
 }
+| file_sql_table_expr
+{
+  $$ = $1;
+}
+;
+
+// A table function that reads a local file.  The function name is resolved by
+// name so that the grammar stays generic and adding a new reader is a resolver
+// change only.
+// NAME_OB (and not relation_name) on purpose: the function names are plain
+// identifiers, and using relation_name would make the rule ambiguous with the
+// table factors that start with a keyword such as HYBRID_SEARCH or UNNEST.
+file_sql_table_expr:
+NAME_OB '(' file_sql_arg_list ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_TABLE_EXPRESSION, 3, $1, $3, NULL);
+}
+| NAME_OB '(' file_sql_arg_list ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| NAME_OB '(' file_sql_arg_list ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
+
+file_sql_arg_list:
+expr
+{
+  malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1);
+}
+| file_sql_arg_list ',' expr
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
 ;
 
 tbl_name:
@@ -12352,8 +12398,17 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE
+{
+  // A non-null marker tells GEN_EXPLAN_STMT that this is a DESCRIBE.
+  malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+  $$->value_ = 1;
+}
+| DESC
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+  $$->value_ = 1;
+}
 ;
 
 explainable_stmt:

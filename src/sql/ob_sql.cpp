@@ -26,6 +26,7 @@
 #include "sql/ob_sql_init.h"
 #include "sql/resolver/ob_resolver.h"
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
+#include "sql/resolver/ddl/ob_explain_stmt.h"
 #include "sql/resolver/cmd/ob_call_procedure_stmt.h"
 #include "sql/resolver/cmd/ob_anonymous_block_stmt.h"
 #include "sql/privilege_check/ob_privilege_check.h"
@@ -270,6 +271,33 @@ int ObSql::fill_result_set(ObResultSet &result_set,
       break;
     }
     case stmt::T_EXPLAIN: {
+      const ObExplainStmt &explain_stmt = static_cast<const ObExplainStmt &>(basic_stmt);
+      if (explain_stmt.is_describe()) {
+        // DESCRIBE exposes the DuckDB column set instead of the plan text.
+        static const char *const describe_columns[] = {
+          "column_name", "column_type", "null", "key", "default", "extra"
+        };
+        const int64_t describe_column_cnt = ARRAYSIZEOF(describe_columns);
+        if (OB_FAIL(result_set.reserve_field_columns(describe_column_cnt))) {
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < describe_column_cnt; ++i) {
+          ObField describe_field;
+          const ObString name = ObString::make_string(describe_columns[i]);
+          const ObString table_name = ObString::make_string("describe_table");
+          describe_field.tname_ = table_name;
+          describe_field.org_tname_ = table_name;
+          describe_field.cname_ = name;
+          describe_field.org_cname_ = name;
+          describe_field.type_.set_type(ObVarcharType);
+          describe_field.charsetnr_ = CS_TYPE_UTF8MB4_GENERAL_CI;
+          describe_field.type_.set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
+          describe_field.type_.set_collation_level(CS_LEVEL_IMPLICIT);
+          describe_field.type_.set_varchar(type_name);
+          if (OB_FAIL(result_set.add_field_column(describe_field))) {
+          }
+        }
+        break;
+      }
       ObString tname = ObString::make_string("explain_table");
       ObString cname = ObString::make_string("Query Plan");
       field.tname_ = tname;

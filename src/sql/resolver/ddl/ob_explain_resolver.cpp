@@ -64,8 +64,15 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
         LOG_WARN("failed to generate stmt for child stmt");
       } else {
         explain_stmt->set_explain_query_stmt(static_cast<ObDMLStmt *>(child_stmt));
+        // DESCRIBE marks itself with a T_BOOL node in the format slot.  The
+        // describing plan (ObExplainLogPlan::generate_describe_plan) is not
+        // enabled yet: it still fails with OB_INVALID_ARGUMENT while the six
+        // column result is built, so DESCRIBE keeps explaining for now.
+        UNUSED(parse_tree.children_[EXPLAIN_FORMAT]);
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
-        if (NULL != format) {
+        if (NULL != format && T_BOOL == format->type_) {
+          // The DESCRIBE marker is not an explain format.
+        } else if (NULL != format) {
           switch (format->type_) {
           case T_OUTLINE:
           {

@@ -33,6 +33,8 @@ namespace sql
     virtual int generate_normal_raw_plan() override;
   private:
     int check_explain_generate_plan_with_outline(ObLogPlan *real_plan);
+  // Builds the DuckDB style DESCRIBE result rows for the inner statement.
+  int generate_describe_plan(ObLogicalOperator &top, const ObDMLStmt &child_stmt);
     DISALLOW_COPY_AND_ASSIGN(ObExplainLogPlan);
   };
 }

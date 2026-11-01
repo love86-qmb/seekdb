@@ -2273,6 +2273,9 @@ typedef enum ObItemType
   T_FORK_TABLE = 4916,
   T_FORK_DATABASE = 4917,
   T_DIFF_TABLE = 4918,
+  // A file table function appearing in a FROM clause
+  // (read_csv/read_json/read_parquet/glob).
+  T_FILE_SQL_TABLE_EXPRESSION = 4921,
   T_MERGE_TABLE = 4919,
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;

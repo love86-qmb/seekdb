@@ -18,6 +18,7 @@
 #define _OB_JOIN_ORDER_H 1
 #include "lib/container/ob_int_flags.h"
 #include "sql/ob_sql_define.h"
+#include "sql/engine/basic/ob_file_sql_format.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/optimizer/ob_optimizer_util.h"
@@ -397,6 +398,7 @@ class Path
     bool is_join_path() const;
     bool is_subquery_path() const;
     bool is_values_table_path() const;
+    bool is_file_sql_table_path() const;
     int check_is_base_table(bool &is_base_table);
     inline const common::ObIArray<OrderItem> &get_ordering() const { return ordering_; }
     inline common::ObIArray<OrderItem> &get_ordering() { return ordering_; }
@@ -1176,6 +1178,35 @@ class Path
     common::ObSEArray<ObColumnDefault, 1, common::ModulePageAllocator, true> column_param_default_exprs_;
   private:
       DISALLOW_COPY_AND_ASSIGN(JsonTablePath);
+  };
+
+  // Path of a file table function source (read_csv/read_json/read_parquet/glob).
+  // It behaves like a base table path: the operator is a leaf of the plan, so
+  // joins, filters, ordering and aggregates above it are planned normally.
+  class FileSqlTablePath : public Path
+  {
+  public:
+    FileSqlTablePath()
+      : Path(NULL),
+        table_id_(OB_INVALID_ID),
+        table_def_(NULL) {}
+    virtual ~FileSqlTablePath() {}
+    int assign(const FileSqlTablePath &other, common::ObIAllocator *allocator);
+    virtual int estimate_cost() override;
+    int estimate_row_count();
+    virtual int get_name_internal(char *buf, const int64_t buf_len, int64_t &pos) const
+    {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(BUF_PRINTF("@file_sql_"))) {
+      } else if (OB_FAIL(BUF_PRINTF("%lu", table_id_))) {
+      }
+      return ret;
+    }
+  public:
+    uint64_t table_id_;
+    ObFileSqlTableDef *table_def_;
+  private:
+      DISALLOW_COPY_AND_ASSIGN(FileSqlTablePath);
   };
 
   class TempTablePath : public Path
@@ -2044,6 +2075,7 @@ struct NullAwareAntiJoinInfo {
     int generate_function_table_paths();
     int generate_json_table_paths();
     int generate_values_table_paths();
+    int generate_file_sql_table_paths();
     int generate_temp_table_paths();
 
     int compute_sharding_info_for_base_paths(ObIArray<AccessPath *> &access_paths);

@@ -33,6 +33,7 @@
 #include "sql/optimizer/ob_log_expr_values.h"
 #include "sql/optimizer/ob_log_function_table.h"
 #include "sql/optimizer/ob_log_json_table.h"
+#include "sql/optimizer/ob_log_file_sql_table.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_exchange.h"
 #include "sql/optimizer/ob_log_values.h"
@@ -3518,6 +3519,10 @@ int ObLogPlan::create_plan_tree_from_path(Path *path,
     } else if (path->is_values_table_path()) {
       ValuesTablePath *values_table_path = static_cast<ValuesTablePath *>(path);
       if (OB_FAIL(allocate_values_table_path(values_table_path, op))) {
+      } else { /* Do nothing */ }
+    } else if (path->is_file_sql_table_path()) {
+      FileSqlTablePath *file_sql_table_path = static_cast<FileSqlTablePath *>(path);
+      if (OB_FAIL(allocate_file_sql_table_path(file_sql_table_path, op))) {
       } else { /* Do nothing */ }
     } else {
       ret = OB_ERR_UNEXPECTED;
@@ -11783,6 +11788,39 @@ int ObLogPlan::check_storage_distinct_pushdown(const ObIArray<ObRawExpr*> &disti
       } else if (filters.at(i)->has_flag(ObExprInfoFlag::CNT_PL_UDF)) {
         can_push = false;
       }
+    }
+  }
+  return ret;
+}
+
+int ObLogPlan::allocate_file_sql_table_path(FileSqlTablePath *file_sql_table_path,
+                                          ObLogicalOperator *&out_access_path_op)
+{
+  int ret = OB_SUCCESS;
+  ObLogFileSqlTable *op = NULL;
+  TableItem *table_item = NULL;
+  const ObDMLStmt *stmt = get_stmt();
+  if (OB_ISNULL(file_sql_table_path) || OB_ISNULL(stmt) ||
+      OB_ISNULL(table_item = stmt->get_table_item_by_id(file_sql_table_path->table_id_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(op = static_cast<ObLogFileSqlTable *>(
+                          get_log_op_factory().allocate(*this, LOG_FILE_SQL_TABLE)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    op->set_table_id(file_sql_table_path->table_id_);
+    op->set_table_name(table_item->get_table_name());
+    op->set_table_def(table_item->file_sql_table_def_);
+    op->set_file_path(file_sql_table_path);
+    ObSEArray<ObColumnRefRawExpr *, 8> column_exprs;
+    if (OB_ISNULL(table_item->file_sql_table_def_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(stmt->get_column_exprs(file_sql_table_path->table_id_, column_exprs))) {
+    } else if (OB_FAIL(op->get_column_exprs().assign(column_exprs))) {
+    } else if (OB_FAIL(append(op->get_filter_exprs(), file_sql_table_path->filter_))) {
+    } else if (OB_FAIL(op->compute_property(file_sql_table_path))) {
+    } else if (OB_FAIL(op->est_cost())) {
+    } else {
+      out_access_path_op = op;
     }
   }
   return ret;

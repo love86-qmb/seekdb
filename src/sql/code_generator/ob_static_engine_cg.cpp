@@ -102,6 +102,8 @@
 #include "sql/engine/expand/ob_expand_vec_op.h"
 #include "sql/optimizer/ob_log_values_table_access.h"
 #include "sql/engine/basic/ob_values_table_access_op.h"
+#include "sql/engine/basic/ob_file_sql_table_op.h"
+#include "sql/optimizer/ob_log_file_sql_table.h"
 
 namespace oceanbase
 {
@@ -1738,6 +1740,80 @@ int ObStaticEngineCG::generate_spec(ObLogValuesTableAccess &op,
       } else {
         spec.rows_ = table_def->row_cnt_;
       }
+    }
+  }
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(ObLogFileSqlTable &op,
+                                    ObFileSqlTableSpec &spec,
+                                    const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(in_root_job);
+  const ObFileSqlTableDef *table_def = NULL;
+  ObIAllocator &allocator = phy_plan_->get_allocator();
+  if (OB_ISNULL(table_def = op.get_table_def())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file sql table without definition", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator, table_def->path_, spec.path_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, table_def->json_format_, spec.json_format_))) {
+  } else {
+    spec.format_ = table_def->format_;
+    spec.header_ = table_def->header_;
+    spec.delimiter_ = table_def->delimiter_;
+    spec.quote_ = table_def->quote_;
+    spec.column_cnt_ = table_def->column_count();
+    if (OB_FAIL(spec.column_names_.prepare_allocate(table_def->column_count()))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_def->column_count(); ++i) {
+        if (OB_FAIL(ob_write_string(allocator, table_def->column_names_.at(i),
+                                    spec.column_names_.at(i)))) {
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(spec.column_exprs_.prepare_allocate(op.get_column_exprs().count()))) {
+    } else if (OB_FAIL(spec.column_index_.prepare_allocate(op.get_column_exprs().count()))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_exprs().count(); ++i) {
+        ObColumnRefRawExpr *col_expr = op.get_column_exprs().at(i);
+        ObExpr *expr = NULL;
+        if (OB_ISNULL(col_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(generate_rt_expr(*col_expr, expr))) {
+        } else if (OB_ISNULL(expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          // The resolver numbers the file columns with consecutive column ids,
+          // which is how a projected column finds its file position.
+          const int64_t file_idx =
+              static_cast<int64_t>(col_expr->get_column_id()) - OB_APP_MIN_COLUMN_ID;
+          if (OB_UNLIKELY(file_idx < 0 || file_idx >= table_def->column_count())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("file sql: column id out of range", K(ret), K(file_idx));
+          } else {
+            spec.column_exprs_.at(i) = expr;
+            spec.column_index_.at(i) = file_idx;
+          }
+        }
+      }
+    }
+    // The physical operator writes directly into the output columns, so they
+    // have to be marked as produced here.
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_exprs().count(); i++) {
+      ObColumnRefRawExpr *col_expr = op.get_column_exprs().at(i);
+      ObExpr *expr = NULL;
+      if (OB_ISNULL(col_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(mark_expr_self_produced(col_expr))) {
+      } else if (OB_FAIL(generate_rt_expr(*col_expr, expr))) {
+      } else if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs()))) {
     }
   }
   return ret;
@@ -6149,6 +6225,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_VALUES_TABLE_ACCESS: {
       type = PHY_VALUES_TABLE_ACCESS;
+      break;
+    }
+    case log_op_def::LOG_FILE_SQL_TABLE: {
+      type = PHY_FILE_SQL_TABLE_SCAN;
       break;
     }
     case log_op_def::LOG_EXPAND: {

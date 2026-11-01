@@ -50,6 +50,10 @@ public:
   ObDMLStmt* get_explain_query_stmt() const { return explain_query_stmt_; }
   void set_explain_query_stmt(ObDMLStmt *stmt) { explain_query_stmt_ = stmt; }
   bool is_select_explain() const;
+  // true when the statement was written as DESCRIBE/DESC: the result is then the
+  // column description of the inner statement, not its plan.
+  bool is_describe() const { return is_describe_; }
+  void set_is_describe(const bool is_describe) { is_describe_ = is_describe; }
   const common::ObString& get_into_table() const { return into_table_; }
   void set_into_table(const common::ObString& into_table) { into_table_ = into_table; }
   const common::ObString& get_statement_id() const { return statement_id_; }
@@ -64,6 +68,7 @@ private:
   ExplainType format_;
   ObExplainDisplayOpt display_opt_;
   ObDMLStmt *explain_query_stmt_;
+  bool is_describe_;
   common::ObString into_table_;
   common::ObString statement_id_;
   DISALLOW_COPY_AND_ASSIGN(ObExplainStmt);
