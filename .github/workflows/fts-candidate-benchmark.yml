@@ -17,8 +17,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     env:
-      # Last source tree that completed the official benchmark and scored 6.083/50.
-      BASELINE_REF: 5876df4fadd86d278453183a3a91c72bd45369b2
+      # Current safe candidate: official benchmark passes with the bounded
+      # literal TOKENIZE cache.  New experiments must beat this exact tree.
+      BASELINE_REF: f02d6eab97725a6bab46cbee8aa41806640c6275
       INSTANCE_DIR: /tmp/seekdb-fts-instance
       ARTIFACT_DIR: /tmp/fts-candidate-artifacts
       CCACHE_DIR: /tmp/seekdb-fts-ccache

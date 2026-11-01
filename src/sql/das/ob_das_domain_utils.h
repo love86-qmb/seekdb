@@ -55,7 +55,6 @@ public:
 private:
   lib::MemoryContext merge_memctx_;
   ObDomainIndexRow rows_;
-  storage::ObFTWordMap word_map_;
   uint64_t row_idx_;
   bool is_fts_index_aux_;
   storage::ObFTParseHelper helper_;
@@ -187,14 +186,6 @@ public:
                                          const ObDatum &doc_id_datum,
                                          const ObString &fulltext,
                                          const bool is_fts_index_aux,
-                                         ObDomainIndexRow &word_rows);
-  static int generate_fulltext_word_rows(common::ObIAllocator &allocator,
-                                         storage::ObFTParseHelper *helper,
-                                         const common::ObObjMeta &ft_obj_meta,
-                                         const ObDatum &doc_id_datum,
-                                         const ObString &fulltext,
-                                         const bool is_fts_index_aux,
-                                         storage::ObFTWordMap &word_map,
                                          ObDomainIndexRow &word_rows);
   static int generate_multivalue_index_rows(
       ObIAllocator &allocator,
