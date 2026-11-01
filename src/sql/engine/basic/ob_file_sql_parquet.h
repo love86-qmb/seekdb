@@ -30,7 +30,7 @@ struct ObFileSqlParquetColumn
   ObFileSqlParquetColumn()
     : name_(), col_type_(FILE_SQL_COL_VARCHAR), physical_type_(0), nullable_(true) {}
   common::ObString name_;
-  int64_t col_type_;      // the inferred logical type
+  int64_t col_type_;      // the exposed logical type
   int32_t physical_type_; // parquet Type: 0 BOOLEAN, 1 INT32, 2 INT64, 4 FLOAT, 5 DOUBLE, 6 BYTE_ARRAY
   bool nullable_;
 };
@@ -47,28 +47,32 @@ int read_parquet_meta(common::ObIAllocator &alloc,
                       const common::ObString &path,
                       ObFileSqlParquetMeta &meta);
 
-// Streaming parquet scanner.  Only the column chunks that are actually needed
-// are decoded, one page at a time, so the memory used by a scan is bounded by
-// the requested row count and not by the file size.
+// One decoded value of a column chunk.
+struct ObParquetCell
+{
+  ObParquetCell() : is_null_(true), int_value_(0), double_value_(0), str_() {}
+  bool is_null_;
+  int64_t int_value_;
+  double double_value_;
+  common::ObString str_;
+};
+
+// Streaming parquet scanner.  A row group is decoded at a time and only the
+// columns the statement projects are decoded, so the memory a scan uses is
+// bounded by one row group of the projected columns, not by the file size.
 class ObFileSqlParquetReader : public ObFileSqlRowReader
 {
 public:
   ObFileSqlParquetReader();
-  virtual ~ObFileSqlParquetReader() { close(); }
+  virtual ~ObFileSqlParquetReader();
   int init(const ObFileSqlTableDef &def, common::ObIAllocator &alloc);
   virtual int open() override;
   virtual int get_next_row(common::ObIAllocator &alloc,
                            common::ObIArray<ObFileSqlCell> &row) override;
   virtual void close() override;
 private:
-  int load_meta();
-  ObFileReader file_;
-  bool file_opened_;
-  bool inited_;
-  common::ObString path_;
-  int64_t column_count_;
-  int64_t row_cnt_;
-  int64_t row_idx_;
+  struct Impl;
+  Impl *impl_;
 };
 
 } // namespace sql

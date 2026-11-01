@@ -54,6 +54,11 @@ int ObFileSqlTableOp::create_reader()
   def.header_ = MY_SPEC.header_;
   def.delimiter_ = MY_SPEC.delimiter_;
   def.quote_ = MY_SPEC.quote_;
+  // Tell the reader which file columns the plan actually uses.
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_index_.count(); ++i) {
+    if (OB_FAIL(def.projection_.push_back(MY_SPEC.column_index_.at(i)))) {
+    }
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_cnt_; ++i) {
     if (OB_FAIL(def.column_types_.push_back(FILE_SQL_COL_VARCHAR))) {
     } else if (OB_FAIL(def.column_nullable_.push_back(true))) {

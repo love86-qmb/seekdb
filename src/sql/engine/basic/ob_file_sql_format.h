@@ -78,6 +78,7 @@ struct ObFileSqlTableDef
       column_names_(),
       column_types_(),
       column_nullable_(),
+      projection_(),
       row_cnt_(0) {}
 
   int64_t format_;
@@ -95,6 +96,9 @@ struct ObFileSqlTableDef
   // true when at least one sampled value of the column was NULL/empty.  Drives
   // the `null` column of DESCRIBE.
   common::ObSEArray<bool, 16, common::ModulePageAllocator, true> column_nullable_;
+  // File columns the statement projects, so a reader can skip the others.  An
+  // empty list means "no pruning information, read everything".
+  common::ObSEArray<int64_t, 8, common::ModulePageAllocator, true> projection_;
   // Number of rows seen during inference; only used as a cardinality hint.
   int64_t row_cnt_;
 
