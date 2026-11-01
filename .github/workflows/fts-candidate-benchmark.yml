@@ -52,8 +52,12 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential binutils ccache cpio curl file gdb git \
+            build-essential binutils ccache cpio curl file git \
             libaio1 libtool-bin m4 make python3 rpm rpm2cpio wget
+          # The runner currently carries backported libelf/libdw 0.188.
+          # Pull debuginfod and gdb from the same pocket to avoid mixing them
+          # with Jammy's 0.186 debug libraries.
+          sudo apt-get install -y -t jammy-backports gdb libdebuginfod1
 
       - name: Cache downloaded dependencies
         uses: actions/cache@v4
