@@ -64,10 +64,13 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
         LOG_WARN("failed to generate stmt for child stmt");
       } else {
         explain_stmt->set_explain_query_stmt(static_cast<ObDMLStmt *>(child_stmt));
-        // DESCRIBE marks itself with a T_BOOL node in the format slot.  The
-        // describing plan (ObExplainLogPlan::generate_describe_plan) is not
-        // enabled yet: it still fails with OB_INVALID_ARGUMENT while the six
-        // column result is built, so DESCRIBE keeps explaining for now.
+        // DESCRIBE marks itself with a T_BOOL node in the format slot.
+        //
+        // The DuckDB style result is implemented (ObExplainLogPlan::
+        // generate_describe_plan builds the six columns, ObSql::fill_result_set
+        // declares them), but executing it still fails with OB_INVALID_ARGUMENT
+        // after the plan is built, so DESCRIBE keeps explaining for now.  Set
+        // this flag to switch it on.
         UNUSED(parse_tree.children_[EXPLAIN_FORMAT]);
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
         if (NULL != format && T_BOOL == format->type_) {

@@ -68,6 +68,11 @@ int ObExplainLogPlan::generate_normal_raw_plan()
       // Same as the plan-text path: the describe rows are built from ObObj
       // cells, so the datums must not be packed by memcpy.
       optimizer_context_.set_packed(false);
+      // The tail of this function uses values_op, so it has to be set here as
+      // well; values_op->is_describe() then tells the tail not to add the
+      // single output expression it uses for the plan text.
+      values_op = static_cast<ObLogValues *>(top);
+      values_op->set_describe_plan(true);
       if (OB_FAIL(generate_describe_plan(*top, *child_stmt))) {
       } else {
         get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
@@ -116,6 +121,8 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     }
     get_optimizer_context().get_all_exprs().reuse();
     if (OB_FAIL(ret)) {
+    } else if (values_op->is_describe_plan()) {
+      // The describing path already created one output expression per column.
     } else if (OB_FAIL(allocate_output_expr_for_values_op(*values_op))) {
     } else {
       get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
