@@ -1,0 +1,233 @@
+name: FTS Candidate A-B Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fts-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fts-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      # Last source tree that completed the official benchmark and scored 6.083/50.
+      BASELINE_REF: 5876df4fadd86d278453183a3a91c72bd45369b2
+      INSTANCE_DIR: ${{ runner.temp }}/seekdb-fts-instance
+      ARTIFACT_DIR: ${{ runner.temp }}/fts-candidate-artifacts
+      CCACHE_DIR: ${{ runner.temp }}/ccache
+      CCACHE_MAXSIZE: 4G
+
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record candidate revision
+        shell: bash
+        run: echo "CANDIDATE_REF=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Reclaim runner disk space
+        uses: insightsengineering/disk-space-reclaimer@v1
+        with:
+          tools-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential binutils ccache cpio curl file git \
+            libaio1 libtool-bin m4 make python3 rpm rpm2cpio wget
+
+      - name: Cache downloaded dependencies
+        uses: actions/cache@v4
+        with:
+          path: deps/3rd
+          key: seekdb-fts-deps-${{ runner.os }}-${{ hashFiles('deps/init/**') }}
+
+      - name: Cache compiler outputs
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: seekdb-fts-ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            seekdb-fts-ccache-${{ runner.os }}-
+
+      - name: Build stable control
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          mkdir -p "$ARTIFACT_DIR" "$CCACHE_DIR"
+          git checkout --detach "$BASELINE_REF"
+          ccache --zero-stats || true
+          bash build.sh release --init -DOB_USE_CCACHE=ON --make -j2 \
+            2>&1 | tee "$ARTIFACT_DIR/control-build.log"
+          test -x build_release/src/observer/seekdb
+          build_release/src/observer/seekdb -V 2>&1 \
+            | tee "$ARTIFACT_DIR/control-version.txt"
+
+      - name: Benchmark stable control
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLIENT="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/bin/obclient"
+          test -x "$CLIENT"
+          python3 .github/script/seekdb/sdb.py start \
+            --binary "$GITHUB_WORKSPACE/build_release/src/observer/seekdb" \
+            --base-dir "$INSTANCE_DIR" --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
+            --port 2881 --timeout 240
+
+          MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
+          MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
+          OUTPUT="$ARTIFACT_DIR/control-report.txt" LABEL="control-${BASELINE_REF:0:12}" \
+          ROWS=20000 BATCH=500 ROUNDS=3000 QUERY_ROUNDS=200 \
+          SAMPLES=3 WARMUP=30 SKIP_LOAD=0 \
+            bash tools/benchmark/fts_large_bench.sh 2>&1 \
+              | tee "$ARTIFACT_DIR/control-benchmark.log"
+
+          python3 .github/script/seekdb/sdb.py destroy --base-dir "$INSTANCE_DIR"
+
+      - name: Build candidate incrementally
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          git checkout --detach "$CANDIDATE_REF"
+          bash build.sh release -DOB_USE_CCACHE=ON --make -j2 \
+            2>&1 | tee "$ARTIFACT_DIR/candidate-build.log"
+          test -x build_release/src/observer/seekdb
+          build_release/src/observer/seekdb -V 2>&1 \
+            | tee "$ARTIFACT_DIR/candidate-version.txt"
+          ccache --show-stats || true
+
+      - name: Benchmark candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLIENT="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/bin/obclient"
+          python3 .github/script/seekdb/sdb.py start \
+            --binary "$GITHUB_WORKSPACE/build_release/src/observer/seekdb" \
+            --base-dir "$INSTANCE_DIR" --port 2881
+          python3 .github/script/seekdb/sdb.py wait-ready \
+            --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
+            --port 2881 --timeout 240
+
+          MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
+          MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
+          OUTPUT="$ARTIFACT_DIR/candidate-report.txt" LABEL="candidate-${CANDIDATE_REF:0:12}" \
+          ROWS=20000 BATCH=500 ROUNDS=3000 QUERY_ROUNDS=200 \
+          SAMPLES=3 WARMUP=30 SKIP_LOAD=0 \
+            bash tools/benchmark/fts_large_bench.sh 2>&1 \
+              | tee "$ARTIFACT_DIR/candidate-benchmark.log"
+
+      - name: Validate correctness and compare A-B results
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$ARTIFACT_DIR/control-report.txt" "$ARTIFACT_DIR/candidate-report.txt" <<'PY' | tee "$ARTIFACT_DIR/comparison.txt"
+          import re
+          import sys
+          from pathlib import Path
+          from statistics import mean
+
+          metric_re = re.compile(
+              r"^\s*([A-Za-z0-9_]+):\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*$"
+          )
+
+          def load(path):
+              values = {}
+              for line in Path(path).read_text(encoding="utf-8").splitlines():
+                  match = metric_re.match(line)
+                  if match:
+                      values[match.group(1)] = float(match.group(2))
+              return values
+
+          control, candidate = map(load, sys.argv[1:])
+          expected_hits = {
+              "query_cn_hits": 8001,
+              "query_beng_hits": 11000,
+              "query_mixed_hits": 7332,
+              "query_limit_hits": 20,
+          }
+          for label, values in (("control", control), ("candidate", candidate)):
+              actual = {key: int(values.get(key, -1)) for key in expected_hits}
+              if actual != expected_hits:
+                  raise SystemExit(
+                      f"{label} FTS hit mismatch: expected={expected_hits}, actual={actual}"
+                  )
+
+          categories = {
+              "build": [
+                  "build_ik_all_sec", "build_ik_content_sec", "build_beng_en_sec"
+              ],
+              "tokenize": ["tokenize_ik_avg_ms", "tokenize_beng_avg_ms"],
+              "query": [
+                  "query_cn_avg_ms", "query_beng_avg_ms",
+                  "query_mixed_avg_ms", "query_limit_avg_ms"
+              ],
+          }
+          category_improvements = []
+          print("FTS candidate versus stable control")
+          print("===================================")
+          for category, metrics in categories.items():
+              improvements = []
+              for metric in metrics:
+                  before, after = control[metric], candidate[metric]
+                  improvement = (before - after) / before
+                  improvements.append(improvement)
+                  print(
+                      f"{metric}: control={before:.6g}, candidate={after:.6g}, "
+                      f"improvement={improvement * 100:.2f}%"
+                  )
+              category_improvement = mean(improvements)
+              category_improvements.append(category_improvement)
+              print(f"{category}_mean_improvement={category_improvement * 100:.2f}%")
+          overall = mean(category_improvements)
+          print(f"mean_category_improvement={overall * 100:.2f}%")
+          print(f"estimated_contest_point_delta={overall * 100:.3f}")
+          PY
+
+      - name: Collect server diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$ARTIFACT_DIR/server-log"
+          if [[ -d "$INSTANCE_DIR/log" ]]; then
+            cp -a "$INSTANCE_DIR/log/." "$ARTIFACT_DIR/server-log/" || true
+          fi
+
+      - name: Stop isolated seekdb
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$INSTANCE_DIR/.sdb-instance" ]]; then
+            python3 .github/script/seekdb/sdb.py destroy \
+              --base-dir "$INSTANCE_DIR" || true
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fts-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/fts-candidate-artifacts
+          if-no-files-found: warn
+          retention-days: 14
