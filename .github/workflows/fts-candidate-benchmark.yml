@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential binutils ccache cpio curl file git \
+            build-essential binutils ccache cpio curl file gdb git \
             libaio1 libtool-bin m4 make python3 rpm rpm2cpio wget
 
       - name: Cache downloaded dependencies
@@ -123,6 +123,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ulimit -c unlimited
+          sudo sysctl -w kernel.core_pattern="$ARTIFACT_DIR/core.%e.%p"
           CLIENT="$GITHUB_WORKSPACE/deps/3rd/u01/obclient/bin/obclient"
           python3 .github/script/seekdb/sdb.py start \
             --binary "$GITHUB_WORKSPACE/build_release/src/observer/seekdb" \
@@ -254,6 +256,18 @@ jobs:
           if [[ -d "$INSTANCE_DIR/log" ]]; then
             cp -a "$INSTANCE_DIR/log/." "$ARTIFACT_DIR/server-log/" || true
           fi
+          shopt -s nullglob
+          core_files=("$ARTIFACT_DIR"/core.*)
+          for core_file in "${core_files[@]}"; do
+            gdb -q -batch \
+              -ex 'set pagination off' \
+              -ex 'thread apply all bt full' \
+              "$GITHUB_WORKSPACE/build_release/src/observer/seekdb" \
+              "$core_file" \
+              > "$ARTIFACT_DIR/$(basename "$core_file").backtrace.txt" 2>&1 \
+              || true
+            rm -f -- "$core_file"
+          done
 
       - name: Stop isolated seekdb
         if: always()
