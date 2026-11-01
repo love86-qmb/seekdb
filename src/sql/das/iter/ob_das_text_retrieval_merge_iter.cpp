@@ -2215,7 +2215,7 @@ int ObDASTRDaatLookupIter::next_disjunctive_document(const int capacity)
       }
 
       if (OB_SUCC(ret)) {
-        const double relevance_score = ir_ctdef_->need_calc_relevance() ? cur_doc_relevance : 0;
+        const double relevance_score = ir_ctdef_->need_calc_relevance() ? cur_doc_relevance : 1;
         int64_t pos = hints_[next_written_idx_];
         if (pos < capacity) {
           ObEvalCtx::BatchInfoScopeGuard guard(*ctx);

@@ -3057,7 +3057,10 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
-  if (OB_SUCC(ret) && (tr_info.need_calc_relevance_ || nullptr != tr_info.pushdown_match_filter_)) {
+  // Even when the numeric BM25 score is unused, MATCH still appears as a
+  // boolean WHERE predicate.  Keep its projection so the retrieval iterator
+  // can publish the existing constant-positive value for matched documents.
+  if (OB_SUCC(ret)) {
     if (OB_FAIL(cg_.generate_rt_expr(*tr_info.match_expr_,
                                             text_ir_scan_ctdef.relevance_proj_col_))) {
     } else if (OB_ISNULL(text_ir_scan_ctdef.relevance_proj_col_)) {
