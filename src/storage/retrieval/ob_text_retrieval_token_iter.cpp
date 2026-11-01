@@ -529,8 +529,12 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
   } else {
     cur_idx_ = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    const sql::ObBitVector *skip = token_iter_->get_skip();
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
+      // The skip vector is only allocated for BM25 expression evaluation.
+      // Scoreless boolean MATCH has no skipped expression rows, so a null
+      // vector means every scanned document id is valid.
+      if (OB_ISNULL(skip) || OB_LIKELY(!skip->at(i))) {
         if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
         };
       }
