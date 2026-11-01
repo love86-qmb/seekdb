@@ -19,9 +19,9 @@ jobs:
     env:
       # Last source tree that completed the official benchmark and scored 6.083/50.
       BASELINE_REF: 5876df4fadd86d278453183a3a91c72bd45369b2
-      INSTANCE_DIR: ${{ runner.temp }}/seekdb-fts-instance
-      ARTIFACT_DIR: ${{ runner.temp }}/fts-candidate-artifacts
-      CCACHE_DIR: ${{ runner.temp }}/ccache
+      INSTANCE_DIR: /tmp/seekdb-fts-instance
+      ARTIFACT_DIR: /tmp/fts-candidate-artifacts
+      CCACHE_DIR: /tmp/seekdb-fts-ccache
       CCACHE_MAXSIZE: 4G
 
     steps:
@@ -63,7 +63,7 @@ jobs:
       - name: Cache compiler outputs
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/ccache
+          path: ${{ env.CCACHE_DIR }}
           key: seekdb-fts-ccache-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
             seekdb-fts-ccache-${{ runner.os }}-
@@ -228,6 +228,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fts-candidate-${{ github.sha }}
-          path: ${{ runner.temp }}/fts-candidate-artifacts
+          path: ${{ env.ARTIFACT_DIR }}
           if-no-files-found: warn
           retention-days: 14
