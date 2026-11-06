@@ -30,6 +30,9 @@
 #include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/engine/px/ob_granule_iterator_op.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "lib/string/ob_sql_string.h"
+#include "share/system_variable/ob_sys_var_class_type.h"
 
 namespace oceanbase
 {
@@ -1426,6 +1429,121 @@ int ObTableScanOp::set_need_check_outrow_lob()
   return ret;
 }
 
+// An AI column holds derived data, so a row of it can be NULL simply because the value
+// has not been computed yet. With ai_column_strict_read on, a statement that reads such a
+// column must not silently get those NULLs: it is refused instead. The condition is about
+// the column, not about the rows the statement happens to select, so it looks for any row
+// of the table that still has no value. Only the AI columns this scan really reads are
+// looked at, which is what keeps "select id, category" (a statement that mentions no AI
+// column at all) accepted while everything else is guarded.
+int ObTableScanOp::check_ai_column_strict_read()
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = GET_MY_SESSION(ctx_);
+  ObObj strict_read;
+  share::schema::ObSchemaGetterGuard schema_guard;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  const share::schema::ObDatabaseSchema *db_schema = NULL;
+  const uint64_t table_id = MY_SPEC.ref_table_id_;
+  if (ObSQLUtils::is_nested_sql(&ctx_)) {
+    // a nested statement issued by this very statement, not a user read
+  } else if (OB_INVALID_ID == table_id || is_sys_table(table_id)) {
+    // a system table never owns AI columns
+  } else if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ,
+                                               strict_read))) {
+  } else if (0 == strict_read.get_int()) {
+    // the default: a read hands out the rows that are ready and NULL for the others
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(table_id, table_schema))) {
+  } else if (OB_ISNULL(table_schema) || !table_schema->is_user_table()) {
+  } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(),
+                                                      db_schema))) {
+  } else if (OB_ISNULL(db_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // the columns this scan reads, both from the primary table and, when the plan does
+    // an index back, from the index side
+    auto is_accessed = [](const ObDASScanCtDef &ctdef, const uint64_t column_id) -> bool {
+      bool found = false;
+      for (int64_t i = 0; !found && i < ctdef.access_column_ids_.count(); ++i) {
+        found = ctdef.access_column_ids_.at(i) == column_id;
+      }
+      return found;
+    };
+    char state_name[OB_MAX_COLUMN_NAME_LENGTH + 32] = {'\0'};
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      int64_t pos = 0;
+      bool accessed = false;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_hidden()) {
+        // the hidden columns are maintained by the AI column machinery itself
+      } else if (OB_FAIL(databuff_printf(state_name, sizeof(state_name), pos, "%.*s_ai_state",
+                                         column->get_column_name_str().length(),
+                                         column->get_column_name_str().ptr()))) {
+      } else if (NULL == table_schema->get_column_schema(
+                     ObString(static_cast<int32_t>(pos), state_name))) {
+        // not an AI column
+      } else if (FALSE_IT(accessed = is_accessed(MY_CTDEF.scan_ctdef_,
+                                                 column->get_column_id()))) {
+      } else {
+        if (!accessed && NULL != MY_CTDEF.lookup_ctdef_
+            && is_accessed(*MY_CTDEF.lookup_ctdef_, column->get_column_id())) {
+          accessed = true;
+        }
+        if (!accessed) {
+          // this statement does not read that AI column
+        } else {
+          ObSqlString sql;
+          common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+          if (OB_ISNULL(sql_proxy)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(sql.append_fmt("SELECT 1 FROM `%.*s`.`%.*s` WHERE `%.*s` IS NULL "
+                                            "LIMIT 1",
+                                            db_schema->get_database_name_str().length(),
+                                            db_schema->get_database_name_str().ptr(),
+                                            table_schema->get_table_name_str().length(),
+                                            table_schema->get_table_name_str().ptr(),
+                                            column->get_column_name_str().length(),
+                                            column->get_column_name_str().ptr()))) {
+          } else {
+            SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+              common::sqlclient::ObMySQLResult *result = NULL;
+              if (OB_FAIL(sql_proxy->read(res, sql.ptr()))) {
+              } else if (OB_ISNULL(result = res.get_result())) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (OB_FAIL(result->next())) {
+                if (OB_ITER_END == ret) {
+                  // every row of the column already has a value
+                  ret = OB_SUCCESS;
+                }
+              } else {
+                // some row still has no value, the read has to wait for the worker
+                ret = OB_ERR_AI_COLUMN_UNFINISHED_TASK;
+                LOG_USER_ERROR(OB_ERR_AI_COLUMN_UNFINISHED_TASK, table_id,
+                               column->get_column_id());
+              }
+              if (NULL != result) {
+                int close_ret = result->close();
+                if (OB_SUCCESS != close_ret && OB_SUCC(ret)) {
+                  ret = close_ret;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTableScanOp::inner_open()
 {
   int ret = OB_SUCCESS;
@@ -1436,6 +1554,7 @@ int ObTableScanOp::inner_open()
   if (OB_ISNULL(my_session = GET_MY_SESSION(ctx_))) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(ObDASUtils::check_nested_sql_mutating(MY_SPEC.ref_table_id_, ctx_, true))) {
+  } else if (OB_FAIL(check_ai_column_strict_read())) {
   } else if (OB_FAIL(init_table_scan_rtdef())) {
   } else if (MY_SPEC.is_fts_ddl_ && OB_FAIL(fts_index_.init(MY_SPEC.is_fts_index_aux_, MY_SPEC.parser_name_,
           MY_SPEC.parser_properties_))) {

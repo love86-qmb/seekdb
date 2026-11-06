@@ -25,6 +25,9 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "lib/string/ob_sql_string.h"
+#include "share/schema/ob_multi_version_schema_service.h"
 
 namespace oceanbase
 {
@@ -420,6 +423,13 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
         case T_CONVERT_TO_CHARACTER: {
           alter_table_stmt->set_convert_to_character();
           if (OB_FAIL(resolve_convert_to_character(*action_node))) {
+          }
+          break;
+        }
+        // "ALTER TABLE t RETRY AI COLUMN c [WHERE pred]" is not a schema change: it only
+        // rewrites data, and it is the only action the statement may carry.
+        case T_AI_COLUMN_RETRY: {
+          if (OB_FAIL(resolve_ai_column_retry(*action_node, node))) {
           }
           break;
         }
@@ -3263,6 +3273,182 @@ int ObAlterTableResolver::resolve_partitioned_partition(const ParseNode *node,
     } else if (OB_FAIL(table_schema.check_primary_key_cover_partition_column())) {
     } else if (OB_FAIL(table_schema.set_origin_table_name(origin_table_name))) {
     } else if (OB_FAIL(table_schema.set_origin_database_name(origin_database_name))) {
+    }
+  }
+  return ret;
+}
+
+namespace {
+// a byte that can be part of an unquoted identifier in a SQL predicate
+bool is_word_char(const char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+         || '_' == c || '$' == c;
+}
+
+// Rewrite the bare identifier "status" of a RETRY predicate into the retry state of the
+// AI column: a row whose AI value is already there is READY, a row that still has no
+// value is FAILED. A backticked `status`, a quoted string and the "status" that is part
+// of a longer name are left alone, so the physical column keeps working.
+int rewrite_ai_column_retry_status(const ObString &predicate,
+                                   const ObString &ai_column_name,
+                                   ObSqlString &result)
+{
+  int ret = OB_SUCCESS;
+  bool in_backtick = false;
+  bool in_single_quote = false;
+  bool in_double_quote = false;
+  int64_t i = 0;
+  while (OB_SUCC(ret) && i < predicate.length()) {
+    const char c = predicate.ptr()[i];
+    bool is_ident_start = !in_backtick && !in_single_quote && !in_double_quote
+                          && (0 == i || !is_word_char(predicate.ptr()[i - 1]));
+    if ('`' == c) {
+      in_backtick = !in_backtick;
+      ret = result.append(&c, 1);
+      ++i;
+    } else if (!in_backtick && '\'' == c) {
+      in_single_quote = !in_single_quote;
+      ret = result.append(&c, 1);
+      ++i;
+    } else if (!in_backtick && '"' == c) {
+      in_double_quote = !in_double_quote;
+      ret = result.append(&c, 1);
+      ++i;
+    } else if (is_ident_start && 6 <= predicate.length() - i
+               && 0 == strncasecmp(predicate.ptr() + i, "status", 6)
+               && !is_word_char(predicate.ptr()[i + 6])) {
+      // IF(col IS NOT NULL, 'READY', 'FAILED')
+      if (OB_FAIL(result.append("IF(`")) ||
+          OB_FAIL(result.append(ai_column_name)) ||
+          OB_FAIL(result.append("` IS NOT NULL, 'READY', 'FAILED')"))) {
+      }
+      i += 6;
+    } else {
+      ret = result.append(&c, 1);
+      ++i;
+    }
+  }
+  return ret;
+}
+}  // namespace
+
+// "ALTER TABLE t RETRY AI COLUMN c [WHERE pred]" does not change the schema, it only
+// makes the selected rows of an asynchronous AI column pending again by clearing their
+// value: the very next statement on the table then creates the task rows for them, so the
+// background worker recomputes the values. The statement is therefore executed here, as
+// one internal UPDATE, and contributes nothing to the schema change.
+int ObAlterTableResolver::resolve_ai_column_retry(const ParseNode &action_node,
+                                                  const ParseNode &action_list)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  const ParseNode *column_node = NULL;
+  ObString column_name;
+  ObSqlString predicate;
+  ObSqlString sql;
+  share::schema::ObSchemaGetterGuard schema_guard;
+  const share::schema::ObDatabaseSchema *db_schema = NULL;
+  ObSqlString raw_predicate;
+  if (OB_ISNULL(alter_table_stmt) || OB_UNLIKELY(2 != action_node.num_child_)
+      || OB_ISNULL(column_node = action_node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid parse tree for ai column retry", K(ret), K(action_node.num_child_));
+  } else if (1 < action_list.num_child_) {
+    // "retry" rewrites data, it cannot be combined with a schema change
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+  } else if (FALSE_IT(column_name.assign_ptr(column_node->str_value_,
+                                             static_cast<int32_t>(column_node->str_len_)))) {
+  } else {
+    // the schema of the table as it is now, not the one being built by this statement
+    const ObTableSchema &table_schema =
+        NULL != table_schema_ ? *table_schema_ : alter_table_stmt->get_alter_table_schema();
+    const ObColumnSchemaV2 *ai_column = table_schema.get_column_schema(column_name);
+    char state_name[OB_MAX_COLUMN_NAME_LENGTH + 32] = {'\0'};
+    int64_t name_pos = 0;
+    // an AI column is a visible column that owns the hidden "<name>_ai_state" column
+    if (OB_FAIL(databuff_printf(state_name, sizeof(state_name), name_pos, "%.*s_ai_state",
+                                column_name.length(), column_name.ptr()))) {
+    } else if (NULL == ai_column || ai_column->is_hidden()
+               || NULL == table_schema.get_column_schema(
+                     ObString(static_cast<int32_t>(name_pos), state_name))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    } else if (OB_ISNULL(GCTX.schema_service_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+    } else if (OB_FAIL(schema_guard.get_database_schema(table_schema.get_database_id(),
+                                                        db_schema))) {
+    } else if (OB_ISNULL(db_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(build_ai_column_retry_predicate(action_node, *ai_column,
+                                                       raw_predicate))) {
+    } else if (OB_FAIL(rewrite_ai_column_retry_status(raw_predicate.string(),
+                                                      ai_column->get_column_name_str(),
+                                                      predicate))) {
+    } else if (OB_FAIL(sql.append_fmt("UPDATE `%.*s`.`%.*s` SET `%.*s` = NULL WHERE %.*s",
+                                      db_schema->get_database_name_str().length(),
+                                      db_schema->get_database_name_str().ptr(),
+                                      table_schema.get_table_name_str().length(),
+                                      table_schema.get_table_name_str().ptr(),
+                                      ai_column->get_column_name_str().length(),
+                                      ai_column->get_column_name_str().ptr(),
+                                      predicate.string().length(), predicate.string().ptr()))) {
+    } else {
+      common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+      int64_t affected_rows = 0;
+      if (OB_ISNULL(sql_proxy)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+        SQL_RESV_LOG(WARN, "failed to retry the ai column", K(ret), K(sql));
+      } else {
+        LOG_INFO("ai column retry", K(sql), K(affected_rows));
+      }
+    }
+  }
+  return ret;
+}
+
+// The where clause of the RETRY action as SQL text. A parse tree cannot be rendered back
+// into text, so the grammar recorded where the clause starts and ends in the statement,
+// and the text is taken from there. Without a where clause every row is selected.
+int ObAlterTableResolver::build_ai_column_retry_predicate(const ParseNode &action_node,
+                                                          const ObColumnSchemaV2 &ai_column,
+                                                          ObSqlString &predicate)
+{
+  int ret = OB_SUCCESS;
+  const int64_t first = action_node.value_;
+  const int64_t last = action_node.str_len_;
+  const ObString &query = session_info_->get_current_query_string();
+  if (first < 0 || last < 0) {
+    // no where clause: every row of the column is retried
+    if (OB_FAIL(predicate.append("1 = 1"))) {
+    }
+  } else if (OB_UNLIKELY(first < 1 || last < first || last > query.length())) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid where clause position for ai column retry",
+                 K(ret), K(first), K(last), K(query.length()));
+  } else {
+    // the span of "opt_where" starts at the WHERE keyword, the UPDATE puts its own one
+    const char *ptr = query.ptr() + first - 1;
+    int64_t len = last - first + 1;
+    while (len > 0 && (' ' == *ptr || '\t' == *ptr || '\n' == *ptr || '\r' == *ptr)) {
+      ++ptr;
+      --len;
+    }
+    if (len >= 5 && 0 == strncasecmp(ptr, "where", 5) && (5 == len || !is_word_char(ptr[5]))) {
+      ptr += 5;
+      len -= 5;
+      while (len > 0 && (' ' == *ptr || '\t' == *ptr || '\n' == *ptr || '\r' == *ptr)) {
+        ++ptr;
+        --len;
+      }
+    }
+    if (0 == len) {
+      if (OB_FAIL(predicate.append("1 = 1"))) {
+      }
+    } else if (OB_FAIL(predicate.append(ptr, static_cast<int32_t>(len)))) {
     }
   }
   return ret;

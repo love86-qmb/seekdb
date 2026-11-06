@@ -1093,6 +1093,9 @@ typedef enum ObItemType
   T_TABLET_MAX_SIZE = 3386,
   // one key/value option inside the WITH (...) part of an AI COLUMN clause
   T_AI_COLUMN_OPTION = 3388,
+  // "ALTER TABLE t RETRY AI COLUMN c [WHERE pred]" - children: the column name and the
+  // optional where clause
+  T_AI_COLUMN_RETRY = 4922,
   T_BLOCK_SIZE = 3387,
   T_TABLET_ID = 3391,
   T_LS_TABLET = 3393,

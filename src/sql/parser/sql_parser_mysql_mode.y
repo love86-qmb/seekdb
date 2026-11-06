@@ -345,7 +345,7 @@ END_P SET_VAR DELIMITER
         REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
-        RANK READ_ONLY RECOVERY REJECT ROLE
+        RANK READ_ONLY RECOVERY REJECT ROLE RETRY
 
         SAMPLE SAVEPOINT SCALARS SCHEMA_NAME SCN SCOPE SCORE SECOND SECURITY SEED
         SEMISTRUCT_ENCODING_TYPE SERIAL SERIALIZABLE SESSION SESSION_USER SET_TP SHARE SHARED SHUTDOWN SIGNED
@@ -14918,6 +14918,21 @@ opt_set table_option_list_space_seperated
 | alter_foreign_key_action
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_FOREIGN_KEY_OPTION, 1, $1);
+}
+| RETRY AI COLUMN column_name opt_where
+{
+  // "ALTER TABLE t RETRY AI COLUMN c [WHERE pred]": invalidate the stored AI value of
+  // the selected rows so that the background worker computes it again. The where clause
+  // is later turned back into SQL text, so remember where it sits in the statement: the
+  // resolver cannot render a parse tree back into text.
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+  if (NULL != $5) {
+    $$->value_ = @5.first_column;
+    $$->str_len_ = @5.last_column;
+  } else {
+    $$->value_ = -1;
+    $$->str_len_ = -1;
+  }
 }
 |
 DROP CONSTRAINT constraint_name

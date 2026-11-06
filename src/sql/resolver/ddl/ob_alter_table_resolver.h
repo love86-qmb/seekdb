@@ -19,6 +19,7 @@
 
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
+#include "lib/string/ob_sql_string.h"
 
 namespace oceanbase
 {
@@ -87,6 +88,14 @@ public:
   int resolve_alter_table_force(const ParseNode &node);
   int resolve_drop_unused_columns(const ParseNode &node);
   int resolve_rename_column(const ParseNode &node);
+  // "ALTER TABLE t RETRY AI COLUMN c [WHERE pred]": invalidate the stored value of an
+  // asynchronous AI column for the selected rows, which brings them back into the
+  // pending state so that the background worker recomputes them.
+  int resolve_ai_column_retry(const ParseNode &action_node, const ParseNode &action_list);
+  // the where clause of the RETRY action, as SQL text
+  int build_ai_column_retry_predicate(const ParseNode &action_node,
+                                      const share::schema::ObColumnSchemaV2 &ai_column,
+                                      common::ObSqlString &predicate);
   int fill_table_option(const share::schema::ObTableSchema *table_schema);
   //save table option to AlterTableArg
   int set_table_options();

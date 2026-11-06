@@ -606,6 +606,9 @@ protected:
   int pushdown_attach_task_to_das(ObDASScanOp &target_op);
   int attach_related_taskinfo(ObDASScanOp &target_op, ObDASBaseRtDef *attach_rtdef);
   int do_table_scan();
+  // ai_column_strict_read: refuse to read an AI column whose value is still missing for
+  // some row of the table, instead of returning rows whose AI value is NULL.
+  int check_ai_column_strict_read();
   int get_next_row_with_das();
   bool need_init_checksum();
   int init_ddl_column_checksum();
