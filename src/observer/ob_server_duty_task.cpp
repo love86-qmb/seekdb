@@ -129,25 +129,6 @@ void ObSqlMemoryTimerTask::runTimerTask()
 
 namespace {
 
-// one pending __all_ai_column_task row joined with its AI column metadata
-struct ObAiColumnTaskRow
-{
-  ObAiColumnTaskRow()
-    : table_id_(OB_INVALID_ID), column_id_(OB_INVALID_ID), retry_count_(0), max_retries_(0)
-  {
-  }
-  uint64_t table_id_;
-  uint64_t column_id_;
-  int64_t retry_count_;
-  int64_t max_retries_;
-  ObString row_key_;
-  ObString rowkey_predicate_;
-  ObString column_name_;
-  ObString expr_text_;
-  ObString table_name_;
-  ObString database_name_;
-};
-
 // the separator between the model name and the value expression inside
 // __all_ai_column.expr_text
 const char AI_COLUMN_EXPR_SEPARATOR = '\x1f';
@@ -247,21 +228,24 @@ int ObAiColumnServerWorker::process_pending_tasks()
   if (OB_ISNULL(sql_proxy)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(sql.append_fmt(
-               "SELECT task.table_id, task.column_id, task.row_key, task.rowkey_predicate, "
-               "task.retry_count, c.column_name, c.expr_text, c.max_retries, "
-               "tb.table_name, db.database_name "
+               "SELECT task.table_id, task.column_id, task.request_id, task.row_key, "
+               "task.rowkey_predicate, task.retry_count, c.column_name, c.expr_text, "
+               "c.max_retries, tb.table_name, db.database_name "
                "FROM %s.%s task "
                "JOIN %s.%s c ON c.table_id = task.table_id AND c.column_id = task.column_id "
                "JOIN %s.%s tb ON tb.table_id = task.table_id "
                "JOIN %s.%s db ON db.database_id = tb.database_id "
                "WHERE task.state IN (0, 3) "
                "AND (task.eligible_ts IS NULL OR task.eligible_ts <= now(6)) "
+               // the rows of one request group have to stay adjacent, because the
+               // columns of a group are written together in a single UPDATE
+               "ORDER BY task.table_id, task.row_key, task.request_id, task.column_id "
                "LIMIT %ld",
                OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TASK_TNAME,
                OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TNAME,
                OB_SYS_DATABASE_NAME, OB_ALL_TABLE_TNAME,
                OB_SYS_DATABASE_NAME, OB_ALL_DATABASE_TNAME,
-               MAX_TASK_PER_ROUND))) {
+               MAX_TASK_PER_ROUND * 8))) {
   } else {
     ObSEArray<ObAiColumnTaskRow, 8> tasks;
     SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
@@ -283,19 +267,20 @@ int ObAiColumnServerWorker::process_pending_tasks()
           } else if (FALSE_IT(row.table_id_ = static_cast<uint64_t>(int_value))) {
           } else if (OB_FAIL(result->get_int(static_cast<int64_t>(1), int_value))) {
           } else if (FALSE_IT(row.column_id_ = static_cast<uint64_t>(int_value))) {
-          } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(2), tmp))) {
-          } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.row_key_))) {
+          } else if (OB_FAIL(result->get_int(static_cast<int64_t>(2), row.request_id_))) {
           } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(3), tmp))) {
+          } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.row_key_))) {
+          } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(4), tmp))) {
           } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.rowkey_predicate_))) {
-          } else if (OB_FAIL(result->get_int(static_cast<int64_t>(4), row.retry_count_))) {
-          } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(5), tmp))) {
-          } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.column_name_))) {
+          } else if (OB_FAIL(result->get_int(static_cast<int64_t>(5), row.retry_count_))) {
           } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(6), tmp))) {
+          } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.column_name_))) {
+          } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(7), tmp))) {
           } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.expr_text_))) {
-          } else if (OB_FAIL(result->get_int(static_cast<int64_t>(7), row.max_retries_))) {
-          } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(8), tmp))) {
-          } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.table_name_))) {
+          } else if (OB_FAIL(result->get_int(static_cast<int64_t>(8), row.max_retries_))) {
           } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(9), tmp))) {
+          } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.table_name_))) {
+          } else if (OB_FAIL(result->get_varchar(static_cast<int64_t>(10), tmp))) {
           } else if (OB_FAIL(ob_write_string(allocator_, tmp, row.database_name_))) {
           } else if (OB_FAIL(tasks.push_back(row))) {
           }
@@ -303,16 +288,32 @@ int ObAiColumnServerWorker::process_pending_tasks()
       }
     }
     if (OB_SUCC(ret)) {
-      for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
-        const ObAiColumnTaskRow &row = tasks.at(i);
-        int tmp_ret = process_one_task(row.table_id_, row.column_id_, row.row_key_,
-                                       row.rowkey_predicate_, row.retry_count_,
-                                       row.max_retries_, row.column_name_, row.expr_text_,
-                                       row.table_name_, row.database_name_);
-        if (OB_SUCCESS != tmp_ret) {
-          // one failing task must not stop the others
-          report_error(tmp_ret);
+      // A request group is the set of AI columns of one row that the same statement
+      // created. The columns of a group are rendered, computed and written together:
+      // writing them with one UPDATE is what keeps a reader from seeing one column of
+      // the row filled while another one is still missing.
+      int64_t begin = 0;
+      while (OB_SUCC(ret) && begin < tasks.count()) {
+        int64_t end = begin + 1;
+        while (end < tasks.count()
+               && tasks.at(end).table_id_ == tasks.at(begin).table_id_
+               && tasks.at(end).request_id_ == tasks.at(begin).request_id_
+               && 0 == tasks.at(end).row_key_.compare(tasks.at(begin).row_key_)) {
+          ++end;
         }
+        ObSEArray<const ObAiColumnTaskRow *, 4> group;
+        for (int64_t g = begin; OB_SUCC(ret) && g < end; ++g) {
+          if (OB_FAIL(group.push_back(&tasks.at(g)))) {
+          }
+        }
+        if (OB_SUCC(ret)) {
+          int tmp_ret = process_task_group(group);
+          if (OB_SUCCESS != tmp_ret) {
+            // one failing group must not stop the others
+            report_error(tmp_ret);
+          }
+        }
+        begin = end;
       }
     }
   }
@@ -420,6 +421,13 @@ int ObAiColumnServerWorker::call_model(ObIAllocator &allocator,
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(model_name, allocator,
                                                              endpoint_info))) {
+  } else if (ObAIFuncUtils::is_dense_embedding_type(info)) {
+    // An embedding model answers with the vector itself, there is no prompt and no
+    // answer format to ask for.
+    ObAIFuncModel model(allocator, *info, endpoint_info);
+    if (OB_FAIL(model.call_dense_embedding(user_content, NULL, result))) {
+      LOG_INFO("ai column embedding call failed", "ret", ret, K(model_name), K(content));
+    }
   } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(allocator,
                  endpoint_info.get_provider(), complete_provider))) {
   } else if (OB_ISNULL(complete_provider)) {
@@ -464,16 +472,47 @@ int ObAiColumnServerWorker::delete_task(const int64_t table_id,
                                     table_id, column_id))) {
   } else if (OB_FAIL(append_sql_string(row_key, sql))) {
   } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
-    LOG_WARN("failed to delete ai column task", KR(ret), K(sql));
+    LOG_INFO("failed to delete ai column task", "ret", ret, K(sql));
   }
   return ret;
 }
 
-int ObAiColumnServerWorker::update_row(const ObString &database_name,
-                                       const ObString &table_name,
-                                       const ObString &column_name,
-                                       const ObString &rowkey_predicate,
-                                       const ObString &value)
+// Drop every task row of the group in one statement.
+int ObAiColumnServerWorker::delete_task_group(
+    const common::ObIArray<const ObAiColumnTaskRow *> &group)
+{
+  int ret = OB_SUCCESS;
+  common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(sql_proxy) || group.empty()) {
+    ret = group.empty() ? OB_INVALID_ARGUMENT : OB_NOT_INIT;
+  } else if (OB_FAIL(sql.append_fmt("DELETE FROM %s.%s WHERE table_id = %ld "
+                                    "AND row_key = ",
+                                    OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TASK_TNAME,
+                                    static_cast<int64_t>(group.at(0)->table_id_)))) {
+  } else if (OB_FAIL(append_sql_string(group.at(0)->row_key_, sql))) {
+  } else if (OB_FAIL(sql.append(" AND column_id IN ("))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < group.count(); ++i) {
+      if (OB_FAIL(sql.append_fmt("%s%ld", 0 == i ? "" : ", ",
+                                 static_cast<int64_t>(group.at(i)->column_id_)))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(sql.append(")"))) {
+    } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+      LOG_INFO("failed to delete ai column task group", "ret", ret, K(sql));
+    }
+  }
+  return ret;
+}
+
+// Write the answers of a whole group. The task rows go first: a reader that already
+// sees the new values must not see the task rows any more.
+int ObAiColumnServerWorker::write_task_group(
+    const common::ObIArray<const ObAiColumnTaskRow *> &group,
+    const common::ObIArray<ObString> &results)
 {
   int ret = OB_SUCCESS;
   common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
@@ -481,99 +520,136 @@ int ObAiColumnServerWorker::update_row(const ObString &database_name,
   int64_t affected_rows = 0;
   if (OB_ISNULL(sql_proxy)) {
     ret = OB_NOT_INIT;
-  } else if (OB_FAIL(sql.append_fmt("UPDATE `%.*s`.`%.*s` SET `%.*s` = ",
-                                    database_name.length(), database_name.ptr(),
-                                    table_name.length(), table_name.ptr(),
-                                    column_name.length(), column_name.ptr()))) {
-  } else if (OB_FAIL(append_sql_string(value, sql))) {
-  } else if (OB_FAIL(sql.append_fmt(" WHERE %.*s", rowkey_predicate.length(),
-                                    rowkey_predicate.ptr()))) {
-  } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
-    LOG_WARN("failed to write back ai column value", KR(ret), K(sql));
+  } else if (group.empty() || group.count() != results.count()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(delete_task_group(group))) {
+  } else {
+    const ObAiColumnTaskRow *first = group.at(0);
+    if (OB_FAIL(sql.append_fmt("UPDATE `%.*s`.`%.*s` SET ",
+                               first->database_name_.length(), first->database_name_.ptr(),
+                               first->table_name_.length(), first->table_name_.ptr()))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < group.count(); ++i) {
+        if (OB_FAIL(sql.append_fmt("%s`%.*s` = ", 0 == i ? "" : ", ",
+                                   group.at(i)->column_name_.length(),
+                                   group.at(i)->column_name_.ptr()))) {
+        } else if (OB_FAIL(append_sql_string(results.at(i), sql))) {
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(sql.append_fmt(" WHERE %.*s", first->rowkey_predicate_.length(),
+                                        first->rowkey_predicate_.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+        LOG_INFO("failed to write back ai column values", "ret", ret, K(sql));
+      }
+    }
   }
   return ret;
 }
 
-int ObAiColumnServerWorker::retry_later(const int64_t table_id,
-                                        const int64_t column_id,
-                                        const ObString &row_key,
-                                        const int64_t retry_count,
-                                        const int64_t max_retries,
-                                        const int error_code)
+int ObAiColumnServerWorker::retry_later(const ObAiColumnTaskRow &task, const int error_code)
 {
   int ret = OB_SUCCESS;
   common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
   ObSqlString sql;
   int64_t affected_rows = 0;
-  const bool terminal = (max_retries >= 0 && retry_count + 1 > max_retries);
-  const int64_t next_state = terminal ? 2 : 3;
+  const bool terminal = (task.max_retries_ >= 0 && task.retry_count_ + 1 > task.max_retries_);
   if (OB_ISNULL(sql_proxy)) {
     ret = OB_NOT_INIT;
-  } else if (OB_FAIL(sql.append_fmt("UPDATE %s.%s SET state = %ld, "
+  } else if (terminal) {
+    // out of retries: the row keeps its NULL value and owns no task any more
+    if (OB_FAIL(delete_task(static_cast<int64_t>(task.table_id_),
+                            static_cast<int64_t>(task.column_id_), task.row_key_))) {
+    }
+  } else if (OB_FAIL(sql.append_fmt("UPDATE %s.%s SET state = 3, "
                                     "retry_count = retry_count + 1, "
                                     "eligible_ts = DATE_ADD(now(6), INTERVAL 1 SECOND), "
                                     "last_error = '%d', gmt_modified = now(6) "
                                     "WHERE table_id = %ld AND column_id = %ld AND row_key = ",
                                     OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TASK_TNAME,
-                                    next_state, error_code, table_id, column_id))) {
-  } else if (OB_FAIL(append_sql_string(row_key, sql))) {
+                                    error_code,
+                                    static_cast<int64_t>(task.table_id_),
+                                    static_cast<int64_t>(task.column_id_)))) {
+  } else if (OB_FAIL(append_sql_string(task.row_key_, sql))) {
   } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
-    LOG_WARN("failed to update ai column task state", KR(ret), K(sql));
+    LOG_INFO("failed to update ai column task state", "ret", ret, K(sql));
   }
   return ret;
 }
 
-int ObAiColumnServerWorker::process_one_task(const int64_t table_id,
-                                             const int64_t column_id,
-                                             const ObString &row_key,
-                                             const ObString &rowkey_predicate,
-                                             const int64_t retry_count,
-                                             const int64_t max_retries,
-                                             const ObString &column_name,
-                                             const ObString &expr_text,
-                                             const ObString &table_name,
-                                             const ObString &database_name)
+// Render every column of the group, ask the model for each of them and then write the
+// whole group at once.
+int ObAiColumnServerWorker::process_task_group(
+    const common::ObIArray<const ObAiColumnTaskRow *> &group)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("AiColWorker");
-  ObString model_name;
-  ObString value_expr;
-  ObString typed_prompt;
-  ObString value;
-  ObString result;
-  bool found = false;
-  split_ai_column_expr_text(expr_text, model_name, value_expr);
-  if (model_name.empty() || value_expr.empty()) {
-    // the metadata of this AI column is unusable, drop the task instead of spinning
-    if (OB_FAIL(delete_task(table_id, column_id, row_key))) {
-    }
-  } else if (OB_FAIL(get_typed_prompt(table_id, column_id, typed_prompt))) {
-  } else if (OB_FAIL(render_value(allocator, database_name, table_name, value_expr,
-                                  rowkey_predicate, value, found))) {
-  } else if (!found) {
-    // the row disappeared, there is nothing to compute
-    if (OB_FAIL(delete_task(table_id, column_id, row_key))) {
-    }
-  } else if (OB_FAIL(call_model(allocator, model_name, typed_prompt, value, result))) {
-    LOG_WARN("ai column model call failed", KR(ret), K(model_name), K(value));
-    int tmp_ret = ret;
-    if (OB_FAIL(retry_later(table_id, column_id, row_key, retry_count, max_retries,
-                            tmp_ret))) {
-    }
-    ret = OB_SUCCESS;
-  } else {
-    // The task row goes first: a reader that already sees the new value must not
-    // see the task row any more, otherwise the two could be observed at once.
-    if (OB_FAIL(delete_task(table_id, column_id, row_key))) {
-    } else if (OB_FAIL(update_row(database_name, table_name, column_name,
-                                  rowkey_predicate, result))) {
-      // put the task back so that the value is computed on the next round
-      int tmp_ret = ret;
-      LOG_WARN("failed to write back the ai column value", KR(tmp_ret));
-      if (OB_FAIL(retry_later(table_id, column_id, row_key, retry_count, max_retries,
-                              tmp_ret))) {
+  ObArenaAllocator allocator("AiColGroup");
+  // the members that can be answered, their rendered input and the model answer
+  ObSEArray<const ObAiColumnTaskRow *, 4> live;
+  ObSEArray<ObString, 4> values;
+  ObSEArray<ObString, 4> results;
+  bool complete = true;
+  for (int64_t i = 0; OB_SUCC(ret) && i < group.count(); ++i) {
+    const ObAiColumnTaskRow *task = group.at(i);
+    ObString model_name;
+    ObString value_expr;
+    ObString typed_prompt;
+    ObString value;
+    ObString result;
+    bool found = false;
+    split_ai_column_expr_text(task->expr_text_, model_name, value_expr);
+    if (model_name.empty() || value_expr.empty()) {
+      // the metadata of this AI column is unusable, drop the task instead of spinning
+      if (OB_FAIL(delete_task(static_cast<int64_t>(task->table_id_),
+                              static_cast<int64_t>(task->column_id_), task->row_key_))) {
       }
+    } else if (OB_FAIL(get_typed_prompt(static_cast<int64_t>(task->table_id_),
+                                        static_cast<int64_t>(task->column_id_),
+                                        typed_prompt))) {
+    } else if (OB_FAIL(render_value(allocator, task->database_name_, task->table_name_,
+                                    value_expr, task->rowkey_predicate_, value, found))) {
+    } else if (!found) {
+      // the row disappeared, there is nothing to compute
+      if (OB_FAIL(delete_task(static_cast<int64_t>(task->table_id_),
+                              static_cast<int64_t>(task->column_id_), task->row_key_))) {
+      }
+    } else if (OB_FAIL(call_model(allocator, model_name, typed_prompt, value, result))) {
+      // the group is written with one UPDATE, so a member that could not be answered
+      // makes the whole group wait: it is answered again on a later round
+      int saved_ret = ret;
       ret = OB_SUCCESS;
+      complete = false;
+      LOG_INFO("ai column model call failed", "ret", saved_ret, K(model_name), K(value));
+      if (OB_FAIL(retry_later(*task, saved_ret))) {
+      }
+    } else if (OB_FAIL(values.push_back(value))) {
+    } else if (OB_FAIL(results.push_back(result))) {
+    } else if (OB_FAIL(live.push_back(task))) {
+    }
+  }
+  if (OB_FAIL(ret) || !complete || live.empty()) {
+  } else {
+    // The row may have changed while the model was answering. Recompute the value
+    // expression of every member: if it no longer renders the value the answer was
+    // computed from, the whole group is dropped, so that a late answer can never
+    // overwrite a newer one.
+    bool still_current = true;
+    for (int64_t i = 0; OB_SUCC(ret) && still_current && i < live.count(); ++i) {
+      const ObAiColumnTaskRow *task = live.at(i);
+      ObString model_name;
+      ObString value_expr;
+      ObString current;
+      bool found = false;
+      split_ai_column_expr_text(task->expr_text_, model_name, value_expr);
+      if (OB_FAIL(render_value(allocator, task->database_name_, task->table_name_,
+                               value_expr, task->rowkey_predicate_, current, found))) {
+      } else if (!found || 0 != current.compare(values.at(i))) {
+        still_current = false;
+      }
+    }
+    if (OB_FAIL(ret) || !still_current) {
+    } else if (OB_FAIL(write_task_group(live, results))) {
+      LOG_INFO("failed to write ai column task group", "ret", ret);
     }
   }
   return ret;
