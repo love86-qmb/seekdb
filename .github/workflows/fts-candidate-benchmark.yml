@@ -101,17 +101,6 @@ jobs:
             --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
             --port 2881 --timeout 240
 
-          # GitHub-hosted runners do not expose a usable hardware cycles event.
-          # Sample the userspace software clock instead and let timeout deliver
-          # SIGINT so perf writes a complete data header before reporting.
-          SEEKDB_PID="$(pgrep -n -x seekdb)"
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
-          sudo timeout --signal=INT --kill-after=5s 45s \
-            perf record -e cpu-clock:u -F 199 -p "$SEEKDB_PID" \
-              -o "$ARTIFACT_DIR/candidate-perf.data" \
-              2> "$ARTIFACT_DIR/candidate-perf-record.log" &
-          PERF_WRAPPER_PID=$!
-
           MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
           MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
           OUTPUT="$ARTIFACT_DIR/control-report.txt" LABEL="control-${BASELINE_REF:0:12}" \
@@ -148,6 +137,17 @@ jobs:
           python3 .github/script/seekdb/sdb.py wait-ready \
             --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
             --port 2881 --timeout 240
+
+          # GitHub-hosted runners do not expose a usable hardware cycles event.
+          # Sample the userspace software clock instead and let timeout deliver
+          # SIGINT so perf writes a complete data header before reporting.
+          SEEKDB_PID="$(pgrep -n -x seekdb)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          sudo timeout --signal=INT --kill-after=5s 45s \
+            perf record -e cpu-clock:u -F 199 -p "$SEEKDB_PID" \
+              -o "$ARTIFACT_DIR/candidate-perf.data" \
+              2> "$ARTIFACT_DIR/candidate-perf-record.log" &
+          PERF_WRAPPER_PID=$!
 
           MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
           MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
@@ -281,6 +281,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          sudo chown -R "$(id -u):$(id -g)" "$ARTIFACT_DIR" || true
           mkdir -p "$ARTIFACT_DIR/server-log"
           if [[ -d "$INSTANCE_DIR/log" ]]; then
             cp -a "$INSTANCE_DIR/log/." "$ARTIFACT_DIR/server-log/" || true
