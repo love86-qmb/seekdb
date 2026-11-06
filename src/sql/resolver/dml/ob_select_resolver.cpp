@@ -3051,13 +3051,58 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
   return ret;
 }
 
+// Walk the option list of a COPY statement. The grammar folds the options into
+// a left deep T_LINK_NODE tree, so only a recursive walk sees all of them.
+static int file_sql_apply_copy_options(const ParseNode *option,
+                                       ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(option)) {
+  } else if (T_LINK_NODE == option->type_) {
+    for (int32_t i = 0; OB_SUCC(ret) && i < option->num_child_; ++i) {
+      if (OB_FAIL(file_sql_apply_copy_options(option->children_[i], into_item))) {
+      }
+    }
+  } else if (T_PARSE_HEADER == option->type_) {
+    // `header` (the grammar only produces the true form).
+    into_item.with_header_ = OB_NOT_NULL(option->children_[0]) && 0 != option->children_[0]->value_;
+  } else if (T_BOOL == option->type_) {
+    // `format csv`, already validated by the grammar.
+  } else if (T_NULL_IF_EXETERNAL == option->type_) {
+    // `nullstr 'x'`: the text that stands for SQL NULL in the export.
+    const ParseNode *value = option->children_[0];
+    if (OB_NOT_NULL(value) && T_EXPR_LIST == value->type_ && 1 == value->num_child_) {
+      value = value->children_[0];
+    }
+    if (OB_ISNULL(value)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (T_VARCHAR == value->type_ || T_CHAR == value->type_) {
+      into_item.null_str_.assign_ptr(value->str_value_, value->str_len_);
+    } else if (T_QUESTIONMARK == value->type_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "a parameterized nullstr");
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected nullstr node", K(ret), "type", value->type_);
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected copy option", K(ret), "type", option->type_);
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_outfile_without_format(const ParseNode *node,
                                                           ObSelectIntoItem &into_item)
 {
   int ret = OB_SUCCESS;
-  if (node->num_child_ != 5) {
+  // A COPY statement carries a sixth child with its own options (the header
+  // flag and the text used for SQL NULL).
+  if (node->num_child_ != 5 && node->num_child_ != 6) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(resolve_into_const_node(node->children_[0], into_item.outfile_name_))) {
+  } else if (6 == node->num_child_ && OB_NOT_NULL(node->children_[5])
+             && OB_FAIL(file_sql_apply_copy_options(node->children_[5], into_item))) {
   }
   if (OB_SUCC(ret) && NULL != node->children_[1]) { // charset
     ObCharsetType charset_type = CHARSET_INVALID;

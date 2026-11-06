@@ -478,6 +478,7 @@ END_P SET_VAR DELIMITER
 %type <node> lock_tables_stmt unlock_tables_stmt lock_type lock_table_list lock_table opt_local
 %type <node> recyclebin_restore_stmt purge_stmt opt_recyclebin_restore_rename_table opt_recyclebin_restore_rename_database
 %type <node> cache_type
+%type <node> copy_options copy_option_list copy_option
 %type <node> into_opt into_clause field_opt field_term field_term_list line_opt line_term line_term_list into_var_list into_var file_opt file_option_list file_option file_size_const binary_format
 %type <node> string_list text_string string_val_list
 %type <node> list_expr list_partition_element list_partition_expr list_partition_list list_partition_option opt_list_partition_list opt_list_subpartition_list list_subpartition_list list_subpartition_element drop_partition_name_list
@@ -567,6 +568,36 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | COPY select_with_parens TO STRING_VALUE copy_options
+{
+  // A COPY statement is the inner query with the plain INTO OUTFILE clause
+  // attached: the select resolver and the select-into operator then write the
+  // rows, and the options below only fill in the terminator, the header and the
+  // text used for SQL NULL.
+  ParseNode *select_node = $2;
+  ParseNode *into_node = NULL;
+  ParseNode *field_list = NULL;
+  ParseNode *field_term = NULL;
+  ParseNode *separator = NULL;
+  if (OB_ISNULL(select_node) || OB_ISNULL(select_node->children_)) {
+    yyerror(&@1, result, "invalid select in copy statement\n");
+    YYABORT_UNEXPECTED;
+  }
+  // The fields of a CSV export are comma separated.
+  make_name_node(separator, result->malloc_pool_, ",");
+  separator->type_ = T_VARCHAR;
+  malloc_non_terminal_node(field_term, result->malloc_pool_, T_FIELD_TERMINATED_STR, 1, separator);
+  merge_nodes(field_list, result, T_INTO_FIELD_LIST, field_term);
+  // The option list is a T_LINK_NODE tree of T_BOOL ('format csv'),
+  // T_PARSE_HEADER ('header') and T_NULL_IF_EXETERNAL ('nullstr x') leaves. It
+  // travels unchanged to the resolver, which is the only place that can walk it
+  // recursively.
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 6,
+                           $4, NULL, field_list, NULL, NULL, $5);
+  select_node->children_[PARSE_SELECT_INTO] = into_node;
+  $$ = select_node;
+  check_question_mark($$, result);
+}
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8956,6 +8987,69 @@ LIMIT limit_expr OFFSET limit_expr
   // setup_token_pos_info($$, @1.first_column - 1, @4.last_column - @1.first_column + 1);
   check_ret(setup_token_pos_info_and_dup_string($$, result, @1.first_column, @4.last_column),
             &@1, result);
+}
+;
+
+copy_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  $$ = $2;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+// The option names are matched as identifiers so the grammar needs no token for
+// each of them.
+copy_option:
+FORMAT NAME_OB
+{
+  // format csv
+  if (OB_ISNULL($2->str_value_) || 0 != strncasecmp($2->str_value_, "csv", $2->str_len_)) {
+    yyerror(&@2, result, "only the csv format is supported by copy\n");
+    YYABORT_UNEXPECTED;
+  } else {
+    malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+    $$->value_ = 1;
+  }
+}
+| NAME_OB STRING_VALUE
+{
+  // nullstr 'NULL'
+  if (OB_ISNULL($1->str_value_) || 0 != strncasecmp($1->str_value_, "nullstr", $1->str_len_)) {
+    yyerror(&@1, result, "unknown copy option\n");
+    YYABORT_UNEXPECTED;
+  } else {
+    ParseNode *value_list = NULL;
+    malloc_list_node(value_list, result->malloc_pool_, T_EXPR_LIST, 2, 1, $2);
+    malloc_non_terminal_node($$, result->malloc_pool_, T_NULL_IF_EXETERNAL, 1, value_list);
+  }
+}
+| NAME_OB
+{
+  // header
+  if (OB_ISNULL($1->str_value_) || 0 != strncasecmp($1->str_value_, "header", $1->str_len_)) {
+    yyerror(&@1, result, "unknown copy option\n");
+    YYABORT_UNEXPECTED;
+  } else {
+    ParseNode *bool_node = NULL;
+    malloc_terminal_node(bool_node, result->malloc_pool_, T_BOOL);
+    bool_node->value_ = 1;
+    malloc_non_terminal_node($$, result->malloc_pool_, T_PARSE_HEADER, 1, bool_node);
+  }
 }
 ;
 

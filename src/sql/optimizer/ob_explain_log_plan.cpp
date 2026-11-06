@@ -59,26 +59,6 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     } else if (OB_FAIL(allocate_values_as_top(top))) {
     } else if (OB_ISNULL(top) || OB_UNLIKELY(LOG_VALUES != top->get_type())) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (explain_stmt->is_describe()) {
-      // DESCRIBE returns the column description of the inner statement, not its
-      // plan, so the describing rows replace the plan text.
-      set_plan_root(top);
-      top->mark_is_plan_root();
-      child_plan->get_optimizer_context().set_batch_size(batch_size);
-      // Same as the plan-text path: the describe rows are built from ObObj
-      // cells, so the datums must not be packed by memcpy.
-      optimizer_context_.set_packed(false);
-      // The tail of this function uses values_op, so it has to be set here as
-      // well; values_op->is_describe() then tells the tail not to add the
-      // single output expression it uses for the plan text.
-      values_op = static_cast<ObLogValues *>(top);
-      values_op->set_describe_plan(true);
-      if (OB_FAIL(generate_describe_plan(*top, *child_stmt))) {
-      } else {
-        get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
-                                             ObPhyPlanType::OB_PHY_PLAN_LOCAL,
-                                             false);
-      }
     } else {
       set_plan_root(top);
       top->mark_is_plan_root();
@@ -121,125 +101,11 @@ int ObExplainLogPlan::generate_normal_raw_plan()
     }
     get_optimizer_context().get_all_exprs().reuse();
     if (OB_FAIL(ret)) {
-    } else if (values_op->is_describe_plan()) {
-      // The describing path already created one output expression per column.
     } else if (OB_FAIL(allocate_output_expr_for_values_op(*values_op))) {
     } else {
       get_optimizer_context().set_plan_type(ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             ObPhyPlanType::OB_PHY_PLAN_LOCAL,
                                             false);
-    }
-  }
-  return ret;
-}
-
-// DuckDB style DESCRIBE: one row per output column, with six columns.
-int ObExplainLogPlan::generate_describe_plan(ObLogicalOperator &top,
-                                            const ObDMLStmt &child_stmt)
-{
-  int ret = OB_SUCCESS;
-  ObLogValues *values_op = NULL;
-  const int64_t DESCRIBE_COLUMN_CNT = 6;
-  static const char *const describe_column_names[DESCRIBE_COLUMN_CNT] = {
-    "column_name", "column_type", "null", "key", "default", "extra"
-  };
-  if (OB_UNLIKELY(LOG_VALUES != top.get_type())) {
-    ret = OB_ERR_UNEXPECTED;
-  } else {
-    values_op = static_cast<ObLogValues *>(&top);
-    const ObFileSqlTableDef *file_def = NULL;
-    // When the inner statement reads a single file table, the description comes
-    // straight from the inferred schema; it is the only source that knows the
-    // column types and which columns saw a NULL.
-    if (child_stmt.is_select_stmt()) {
-      const ObSelectStmt &select_stmt = static_cast<const ObSelectStmt &>(child_stmt);
-      const TableItem *single_item = NULL;
-      int64_t table_cnt = 0;
-      for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt.get_table_size(); ++i) {
-        const TableItem *item = select_stmt.get_table_item(i);
-        if (OB_ISNULL(item)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (item->is_file_sql_table()) {
-          single_item = item;
-          ++table_cnt;
-        }
-      }
-      if (OB_SUCC(ret) && 1 == table_cnt && OB_NOT_NULL(single_item)) {
-        file_def = single_item->file_sql_table_def_;
-      }
-    }
-    if (OB_FAIL(ret)) {
-    } else {
-      ObSEArray<ObString, 8> names;
-      ObSEArray<ObString, 8> type_names;
-      ObSEArray<ObString, 8> nullable;
-      if (OB_NOT_NULL(file_def)) {
-        for (int64_t i = 0; OB_SUCC(ret) && i < file_def->column_count(); ++i) {
-          if (OB_FAIL(names.push_back(file_def->column_names_.at(i)))) {
-          } else if (OB_FAIL(type_names.push_back(ObString::make_string(
-                       file_sql_col_type_name(file_def->column_types_.at(i)))))) {
-          } else if (OB_FAIL(nullable.push_back(ObString::make_string(
-                       file_def->column_nullable_.at(i) ? "YES" : "NO")))) {
-          }
-        }
-      } else if (child_stmt.is_select_stmt()) {
-        const ObSelectStmt &select_stmt = static_cast<const ObSelectStmt &>(child_stmt);
-        for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt.get_select_item_size(); ++i) {
-          const SelectItem &item = select_stmt.get_select_item(i);
-          if (OB_ISNULL(item.expr_)) {
-            ret = OB_ERR_UNEXPECTED;
-          } else if (OB_FAIL(names.push_back(item.alias_name_))) {
-          } else if (OB_FAIL(type_names.push_back(ObString::make_string(
-                       ob_obj_type_str(item.expr_->get_result_type().get_type()))))) {
-          } else if (OB_FAIL(nullable.push_back(ObString::make_string("YES")))) {
-          }
-        }
-      } else {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "describe of a non select statement");
-      }
-      for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < names.count(); ++row_idx) {
-        ObObj cells[DESCRIBE_COLUMN_CNT];
-        ObNewRow row;
-        cells[0].set_varchar(names.at(row_idx));
-        cells[1].set_varchar(type_names.at(row_idx));
-        cells[2].set_varchar(nullable.at(row_idx));
-        cells[3].set_null();
-        cells[4].set_null();
-        cells[5].set_null();
-        for (int64_t c = 0; OB_SUCC(ret) && c < DESCRIBE_COLUMN_CNT; ++c) {
-          UNUSED(describe_column_names[c]);
-          cells[c].set_collation_type(ObCharset::get_system_collation());
-        }
-        row.cells_ = cells;
-        row.count_ = DESCRIBE_COLUMN_CNT;
-        if (OB_FAIL(values_op->add_row(row))) {
-        }
-      }
-      if (OB_SUCC(ret)) {
-        values_op->set_op_id(0);
-        set_max_op_id(1);
-        // One output expression per describe column.
-        for (int64_t c = 0; OB_SUCC(ret) && c < DESCRIBE_COLUMN_CNT; ++c) {
-          ObConstRawExpr *output = NULL;
-          if (OB_FAIL(optimizer_context_.get_expr_factory().create_raw_expr(T_VARCHAR, output))) {
-          } else {
-            ObObj v;
-            v.set_varchar(ObString::make_string(" "));
-            v.set_collation_type(ObCharset::get_system_collation());
-            output->set_value(v);
-            if (OB_FAIL(output->formalize(optimizer_context_.get_session_info()))) {
-            } else if (OB_FAIL(values_op->get_output_exprs().push_back(output))) {
-            } else if (OB_FAIL(optimizer_context_.get_all_exprs().append(output))) {
-            }
-          }
-        }
-        if (OB_SUCC(ret)) {
-          values_op->set_branch_id(0);
-          values_op->set_id(0);
-          values_op->set_op_id(0);
-        }
-      }
     }
   }
   return ret;

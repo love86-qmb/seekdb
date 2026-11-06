@@ -5553,6 +5553,36 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       } else if (OB_FAIL(spec.select_exprs_.push_back(rt_expr))) {
       }
     }
+    // COPY writes a header line and a NULL text: both come from the statement.
+    const ObDMLStmt *into_stmt = op.get_stmt();
+    if (OB_ISNULL(into_stmt) && OB_NOT_NULL(op.get_plan())) {
+      into_stmt = op.get_plan()->get_stmt();
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(into_stmt) && into_stmt->is_select_stmt()) {
+      const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(into_stmt);
+      const ObSelectIntoItem *into_item = select_stmt->get_select_into();
+      if (OB_NOT_NULL(into_item)) {
+        spec.with_header_ = into_item->with_header_;
+        if (OB_FAIL(ob_write_string(alloc, into_item->null_str_, spec.null_str_))) {
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(spec.header_names_.init(select_stmt->get_select_item_size()))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+        // A plain column select item carries its name in expr_name_; alias_name_
+        // is only set for an explicit alias.
+        const SelectItem &item = select_stmt->get_select_item(i);
+        ObString name = item.alias_name_.empty() ? item.expr_name_ : item.alias_name_;
+        if (name.empty() && OB_NOT_NULL(item.expr_)) {
+          name = item.expr_->get_expr_name();
+        }
+        ObString copied;
+        if (OB_FAIL(ob_write_string(alloc, name, copied))) {
+        } else if (OB_FAIL(spec.header_names_.push_back(copied))) {
+        }
+      }
+    }
     if (OB_SUCC(ret)) {
       spec.into_type_ = op.get_into_type();
       spec.is_optional_ = op.get_is_optional();

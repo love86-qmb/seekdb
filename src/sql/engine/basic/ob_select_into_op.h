@@ -71,7 +71,10 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      header_names_(alloc),
+      with_header_(false),
+      null_str_()
   {
   }
 
@@ -91,6 +94,11 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  // Present only for COPY: the column names of the header line, the text used
+  // for SQL NULL and whether the header line is wanted at all.
+  common::ObFixedArray<common::ObString, common::ObIAllocator> header_names_;
+  bool with_header_;
+  common::ObString null_str_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -105,6 +113,9 @@ public:
       field_str_(),
       line_str_(),
       cs_type_(CS_TYPE_INVALID),
+      header_written_(false),
+      need_rename_(false),
+      final_url_(),
       basic_url_(),
       data_writer_(NULL),
       char_enclose_(0),
@@ -270,6 +281,13 @@ private:
   ObObj line_str_;
   ObObj file_name_;
   common::ObCollationType cs_type_;
+  // The export is written to basic_url_ (a temporary name) and renamed to
+  // final_url_ when every row has been produced, so a failed statement leaves
+  // no partial file behind and an existing file is never clobbered.
+  bool header_written_;
+  bool need_rename_;
+  ObString final_url_;
+  int write_header_line(ObCsvFileWriter &data_writer);
   ObString basic_url_; // url without partition expr
   ObExternalFileWriter* data_writer_;
   char char_enclose_;

@@ -34,15 +34,9 @@ class ObLogValues : public ObLogicalOperator
     ObLogValues(ObLogPlan &plan)
         : ObLogicalOperator(plan),
           explain_plan_(NULL),
-          is_describe_plan_(false),
           row_store_(plan.get_allocator())
     {}
     virtual ~ObLogValues() {}
-    // A DESCRIBE fills this operator with the column description instead of
-    // the plan text; the output expressions are then created by the describing
-    // path, so the plan-text one must not be added on top.
-    bool is_describe_plan() const { return is_describe_plan_; }
-    void set_describe_plan(const bool is_describe_plan) { is_describe_plan_ = is_describe_plan; }
     ObLogPlan *get_explain_plan() const { return explain_plan_; }
     void set_explain_plan(ObLogPlan * const plan) { explain_plan_ = plan; }
     int add_row(const common::ObNewRow &row)
@@ -86,7 +80,6 @@ class ObLogValues : public ObLogicalOperator
     }
   private:
     ObLogPlan *explain_plan_;
-    bool is_describe_plan_;
     common::ObRowStore row_store_;
     DISALLOW_COPY_AND_ASSIGN(ObLogValues);
   };
