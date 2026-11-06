@@ -42,8 +42,6 @@ int ObBEngFTParser::get_next_token(
   word_freq = 0;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
-  } else if (use_ascii_fast_path_) {
-    ret = get_next_ascii_token(word, word_len, char_len, word_freq);
   } else if (OB_ISNULL(token_stream_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(token_stream_->get_next(token, token_freq))) {
@@ -78,76 +76,16 @@ int ObBEngFTParser::init(ObFTParserParam *param)
     analysis_ctx_.cs_ = param->cs_;
     analysis_ctx_.filter_stopword_ = false;
     analysis_ctx_.need_grouping_ = false;
-    ascii_pos_ = 0;
-    use_ascii_fast_path_ = is_ascii_document(param->fulltext_, param->ft_length_);
-    if (!use_ascii_fast_path_) {
-      if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
-      } else if (OB_FAIL(segment(doc_, token_stream_))) {
-      } else if (OB_ISNULL(token_stream_)) {
-        ret = OB_ERR_UNEXPECTED;
-      }
-    }
-    if (OB_SUCC(ret)) {
+    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
+    } else if (OB_FAIL(segment(doc_, token_stream_))) {
+    } else if (OB_ISNULL(token_stream_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
       is_inited_ = true;
     }
   }
   if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
     reset();
-  }
-  return ret;
-}
-
-bool ObBEngFTParser::is_ascii_document(const char *text, const int64_t text_len)
-{
-  bool is_ascii = OB_NOT_NULL(text) && text_len > 0;
-  for (int64_t i = 0; is_ascii && i < text_len; ++i) {
-    is_ascii = 0 == (static_cast<unsigned char>(text[i]) & 0x80);
-  }
-  return is_ascii;
-}
-
-bool ObBEngFTParser::is_ascii_alnum(const unsigned char c)
-{
-  return (c >= '0' && c <= '9')
-      || (c >= 'A' && c <= 'Z')
-      || (c >= 'a' && c <= 'z');
-}
-
-int ObBEngFTParser::get_next_ascii_token(
-    const char *&word,
-    int64_t &word_len,
-    int64_t &char_len,
-    int64_t &word_freq)
-{
-  int ret = OB_SUCCESS;
-  const char *text = doc_.ptr_;
-  const int64_t text_len = doc_.len_;
-  while (ascii_pos_ < text_len
-         && !is_ascii_alnum(static_cast<unsigned char>(text[ascii_pos_]))) {
-    ++ascii_pos_;
-  }
-  if (ascii_pos_ >= text_len) {
-    ret = OB_ITER_END;
-  } else {
-    const int64_t start = ascii_pos_;
-    while (ascii_pos_ < text_len
-           && is_ascii_alnum(static_cast<unsigned char>(text[ascii_pos_]))) {
-      ++ascii_pos_;
-    }
-    word_len = ascii_pos_ - start;
-    char *buf = static_cast<char *>(allocator_.alloc(word_len));
-    if (OB_ISNULL(buf)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
-      for (int64_t i = 0; i < word_len; ++i) {
-        const unsigned char c = static_cast<unsigned char>(text[start + i]);
-        buf[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A'))
-                                         : static_cast<char>(c);
-      }
-      word = buf;
-      char_len = word_len;
-      word_freq = 1;
-    }
   }
   return ret;
 }
@@ -172,8 +110,6 @@ void ObBEngFTParser::reset()
   english_analyzer_.reset();
   doc_.reset();
   token_stream_ = nullptr;
-  ascii_pos_ = 0;
-  use_ascii_fast_path_ = false;
   is_inited_ = false;
 }
 
