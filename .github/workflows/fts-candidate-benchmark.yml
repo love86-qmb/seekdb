@@ -19,7 +19,7 @@ jobs:
     env:
       # Current safe candidate: official benchmark passes with the bounded
       # literal TOKENIZE cache.  New experiments must beat this exact tree.
-      BASELINE_REF: f02d6eab97725a6bab46cbee8aa41806640c6275
+      BASELINE_REF: bcae6b6ea2251bb6df079ed67961b8c196873a4a
       INSTANCE_DIR: /tmp/seekdb-fts-instance
       ARTIFACT_DIR: /tmp/fts-candidate-artifacts
       CCACHE_DIR: /tmp/seekdb-fts-ccache
@@ -100,6 +100,13 @@ jobs:
             --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
             --port 2881 --timeout 240
 
+          printf '%s\n' \
+            "SELECT tokenize('Hello, WORLD! row=42 ASCII_only can''t', 'beng');" \
+            "SELECT tokenize('Café 数据 A-B', 'beng');" \
+            | "$CLIENT" -h127.0.0.1 -P2881 -uroot -N -s \
+                --default-character-set=utf8mb4 \
+                > "$ARTIFACT_DIR/control-tokenize-check.txt"
+
           MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
           MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
           OUTPUT="$ARTIFACT_DIR/control-report.txt" LABEL="control-${BASELINE_REF:0:12}" \
@@ -136,6 +143,13 @@ jobs:
           python3 .github/script/seekdb/sdb.py wait-ready \
             --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
             --port 2881 --timeout 240
+
+          printf '%s\n' \
+            "SELECT tokenize('Hello, WORLD! row=42 ASCII_only can''t', 'beng');" \
+            "SELECT tokenize('Café 数据 A-B', 'beng');" \
+            | "$CLIENT" -h127.0.0.1 -P2881 -uroot -N -s \
+                --default-character-set=utf8mb4 \
+                > "$ARTIFACT_DIR/candidate-tokenize-check.txt"
 
           MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
           MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
@@ -181,6 +195,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cmp "$ARTIFACT_DIR/control-tokenize-check.txt" \
+              "$ARTIFACT_DIR/candidate-tokenize-check.txt"
           python3 - "$ARTIFACT_DIR/control-report.txt" "$ARTIFACT_DIR/candidate-report.txt" "$ARTIFACT_DIR/control-2-report.txt" <<'PY' | tee "$ARTIFACT_DIR/comparison.txt"
           import re
           import sys
