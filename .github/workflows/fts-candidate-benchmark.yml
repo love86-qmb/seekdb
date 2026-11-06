@@ -53,8 +53,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential binutils ccache cpio curl file git \
-            libaio1 libtool-bin linux-tools-common linux-tools-generic \
-            m4 make python3 rpm rpm2cpio wget
+            libaio1 libtool-bin m4 make python3 rpm rpm2cpio wget
           # The runner currently carries backported libelf/libdw 0.188.
           # Pull debuginfod and gdb from the same pocket to avoid mixing them
           # with Jammy's 0.186 debug libraries.
@@ -152,12 +151,6 @@ jobs:
                 --default-character-set=utf8mb4 \
                 > "$ARTIFACT_DIR/candidate-tokenize-check.txt"
 
-          SEEKDB_PID="$(pgrep -n -x seekdb)"
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
-          sudo perf record -F 99 -p "$SEEKDB_PID" \
-            -o "$ARTIFACT_DIR/candidate-perf.data" &
-          PERF_PID=$!
-
           MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
           MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
           OUTPUT="$ARTIFACT_DIR/candidate-report.txt" LABEL="candidate-${CANDIDATE_REF:0:12}" \
@@ -165,14 +158,6 @@ jobs:
           SAMPLES=3 WARMUP=30 SKIP_LOAD=0 \
             bash tools/benchmark/fts_large_bench.sh 2>&1 \
               | tee "$ARTIFACT_DIR/candidate-benchmark.log"
-
-          sudo kill -INT "$PERF_PID" || true
-          wait "$PERF_PID" || true
-          sudo perf report --stdio --no-children \
-            --sort=dso,symbol \
-            -i "$ARTIFACT_DIR/candidate-perf.data" \
-            > "$ARTIFACT_DIR/candidate-perf-report.txt" || true
-          sudo rm -f "$ARTIFACT_DIR/candidate-perf.data"
 
           python3 .github/script/seekdb/sdb.py destroy --base-dir "$INSTANCE_DIR"
 
