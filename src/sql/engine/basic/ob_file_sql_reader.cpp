@@ -494,7 +494,12 @@ int glob_file_sql_paths(ObIAllocator &alloc,
       struct dirent *entry = NULL;
       while (OB_SUCC(ret) && NULL != (entry = ::readdir(dir))) {
         const char *name = entry->d_name;
-        if ('.' == name[0] && ('\0' == name[1] || ('.' == name[1] && '\0' == name[2]))) {
+        // "." and ".." are never results.  Any other dot file is also skipped
+        // unless the pattern itself starts with a dot, which is the behaviour of
+        // a shell glob; without this, archives of the test data expose macOS
+        // "._name" resource forks through glob('dir/*'). */
+        if ('.' == name[0] && ('.' != pat_buf[0] || '\0' == name[1]
+                               || ('.' == name[1] && '\0' == name[2]))) {
           continue;
         }
         if (!match_wildcard(pat_buf, name)) {
