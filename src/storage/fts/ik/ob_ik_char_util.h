@@ -52,6 +52,13 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  // 直接按 charset 分类。分词热路径上 collation→charset 的映射在一次分词内是常量，
+  // 原来每个字符都要重新做一次映射，这里让调用方算一次后传进来。
+  static int classify_first_char_by_charset(ObCharsetType cs_type,
+                                            const char *input,
+                                            const uint8_t char_len,
+                                            CharType &type);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -478,6 +485,33 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
   int ret = OB_SUCCESS;
   ObCharsetType cs_type = ObCharset::charset_type_by_coll(coll_type);
 
+  switch (cs_type) {
+  case CHARSET_UTF8MB4: {
+    ret = do_classify<CHARSET_UTF8MB4>(input, char_len, type);
+    break;
+  }
+  case CHARSET_UTF16: {
+    ret = do_classify<CHARSET_UTF16>(input, char_len, type);
+    break;
+  }
+  case CHARSET_UTF16LE: {
+    ret = do_classify<CHARSET_UTF16LE>(input, char_len, type);
+    break;
+  }
+  default:
+    ret = OB_NOT_SUPPORTED;
+    STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
+    break;
+  }
+  return ret;
+}
+
+inline int ObFTCharUtil::classify_first_char_by_charset(ObCharsetType cs_type,
+                                                        const char *input,
+                                                        const uint8_t char_len,
+                                                        CharType &type)
+{
+  int ret = OB_SUCCESS;
   switch (cs_type) {
   case CHARSET_UTF8MB4: {
     ret = do_classify<CHARSET_UTF8MB4>(input, char_len, type);

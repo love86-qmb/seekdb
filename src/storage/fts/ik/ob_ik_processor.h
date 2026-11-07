@@ -77,6 +77,7 @@ private:
   int prepare_next_char();
 
   ObCollationType coll_type_;
+  ObCharsetType cs_type_;  // coll_type_ 对应的 charset，构造时算一次（逐字符分类不用再映射）
   const char *fulltext_;
   int64_t fulltext_len_;
 
