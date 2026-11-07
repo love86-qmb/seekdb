@@ -106,11 +106,18 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
   }
 
   if (OB_SUCC(ret)) {
-    // Parse cascading update columns
-    if (OB_FAIL(resolve_additional_assignments(tables_assign,
-                                               T_UPDATE_SCOPE))) {
-    } else if (OB_FAIL(resolve_ai_column_invalidation(tables_assign))) {
+    // The AI column invalidation has to run before the implicit assignments are parsed:
+    // resetting an AI column to NULL is an assignment like any other, and everything that
+    // is derived from the assigned columns has to see it. In particular the hidden columns
+    // that back a vector index on the AI column (the vid, plus the type/scn/key/data of the
+    // vector stored in the row) are only rewritten when the vector column itself is one of
+    // the assigned columns, so an invalidation added afterwards would leave them holding the
+    // old vector and a vector index scan would keep returning the row.
+    if (OB_FAIL(resolve_ai_column_invalidation(tables_assign))) {
       SQL_RESV_LOG(WARN, "failed to resolve ai column invalidation", K(ret));
+    } else if (OB_FAIL(resolve_additional_assignments(tables_assign,
+                                                      T_UPDATE_SCOPE))) {
+      // Parse cascading update columns
     }
   }
 
