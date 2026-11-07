@@ -334,8 +334,13 @@ int ObDASTextRetrievalIter::inner_get_next_row()
         *inv_idx_scan_param_.output_exprs_));
     if (ir_ctdef_->need_calc_relevance()) {
       clear_row_wise_evaluated_flag();
-      if (OB_FAIL(fill_token_doc_cnt())) {
+      if (inv_idx_agg_evaluated_) {
+        // token_doc_cnt_ / query_token_weight 由 do_doc_cnt_agg() 一次性算好并写入
+        // （两者都只和查询词相关、与当前文档无关），逐行重复写入纯属浪费。
+      } else if (OB_FAIL(fill_token_doc_cnt())) {
       } else if (OB_FAIL(fill_token_weight())) {
+      }
+      if (OB_FAIL(ret)) {
       } else if (OB_FAIL(project_relevance_expr())) {
       }
     }
@@ -376,8 +381,12 @@ int ObDASTextRetrievalIter::inner_get_next_rows(int64_t &count, int64_t capacity
       const ObBitVector *skip = NULL;
       PRINT_VECTORIZED_ROWS(SQL, DEBUG, *ctx, *inv_idx_scan_param_.output_exprs_, count, skip);
       clear_batch_wise_evaluated_flag(count);
-      if (OB_FAIL(fill_token_doc_cnt())) {
+      if (inv_idx_agg_evaluated_) {
+        // 同上：这两个值与文档无关，do_doc_cnt_agg() 里已经写过一次。
+      } else if (OB_FAIL(fill_token_doc_cnt())) {
       } else if (OB_FAIL(fill_token_weight())) {
+      }
+      if (OB_FAIL(ret)) {
       } else if (OB_FAIL(batch_project_relevance_expr(count))) {
       }
     }
@@ -499,6 +508,10 @@ int ObDASTextRetrievalIter::do_doc_cnt_agg()
     if (OB_FAIL(inv_idx_agg_expr->eval(*eval_ctx, doc_cnt_datum))) {
     } else {
       token_doc_cnt_ = doc_cnt_datum->get_int();
+      // 这两个值只和查询词相关，这里写入一次即可，避免逐行重复写。
+      if (ir_ctdef_->need_calc_relevance() && OB_FAIL(fill_token_doc_cnt())) {
+      } else if (ir_ctdef_->need_calc_relevance() && OB_FAIL(fill_token_weight())) {
+      }
     }
   }
   return ret;
