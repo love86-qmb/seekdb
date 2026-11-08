@@ -51,12 +51,16 @@ struct ObTokenizeLiteralCache
   static constexpr int64_t MAX_RESULT_SIZE = 4 * 1024;
   static constexpr int64_t ARG_COUNT = 2;
 
-  ObTokenizeLiteralCache() : key_size_(0), result_size_(0), valid_(false)
+  ObTokenizeLiteralCache()
+      : owner_(nullptr), key_size_(0), result_size_(0), valid_(false)
   {
     MEMSET(arg_lengths_, 0, sizeof(arg_lengths_));
     MEMSET(arg_types_, 0, sizeof(arg_types_));
     MEMSET(arg_collations_, 0, sizeof(arg_collations_));
   }
+
+  bool owned_by(const ObExpr &expr) const { return owner_ == &expr; }
+  bool is_free() const { return owner_ == nullptr; }
 
   bool can_cache(const ObExpr &expr) const
   {
@@ -92,13 +96,10 @@ struct ObTokenizeLiteralCache
       }
     }
     if (OB_SUCC(ret) && hit) {
-      char *buf = expr.get_str_res_mem(ctx, result_size_);
-      if (OB_ISNULL(buf)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-      } else {
-        MEMCPY(buf, result_, result_size_);
-        res.set_string(buf, result_size_);
-      }
+      // The entry is permanently owned by this constant expression, so its
+      // result buffer remains valid for the lifetime of the worker thread.
+      // Avoid an allocation and JSON copy on every execution.
+      res.set_string(result_, result_size_);
     }
     return ret;
   }
@@ -135,12 +136,14 @@ struct ObTokenizeLiteralCache
     if (storable) {
       const ObString value = res.get_string();
       MEMCPY(result_, value.ptr(), value.length());
+      owner_ = &expr;
       key_size_ = key_pos;
       result_size_ = value.length();
       valid_ = true;
     }
   }
 
+  const ObExpr *owner_;
   int64_t arg_lengths_[ARG_COUNT];
   ObObjType arg_types_[ARG_COUNT];
   ObCollationType arg_collations_[ARG_COUNT];
@@ -151,7 +154,22 @@ struct ObTokenizeLiteralCache
   char result_[MAX_RESULT_SIZE];
 };
 
-thread_local ObTokenizeLiteralCache TOKENIZE_LITERAL_CACHE;
+static constexpr int64_t TOKENIZE_LITERAL_CACHE_COUNT = 4;
+thread_local ObTokenizeLiteralCache TOKENIZE_LITERAL_CACHES[TOKENIZE_LITERAL_CACHE_COUNT];
+
+ObTokenizeLiteralCache *get_tokenize_literal_cache(const ObExpr &expr)
+{
+  ObTokenizeLiteralCache *free_entry = nullptr;
+  ObTokenizeLiteralCache *entry = nullptr;
+  for (int64_t i = 0; i < TOKENIZE_LITERAL_CACHE_COUNT && OB_ISNULL(entry); ++i) {
+    if (TOKENIZE_LITERAL_CACHES[i].owned_by(expr)) {
+      entry = &TOKENIZE_LITERAL_CACHES[i];
+    } else if (OB_ISNULL(free_entry) && TOKENIZE_LITERAL_CACHES[i].is_free()) {
+      free_entry = &TOKENIZE_LITERAL_CACHES[i];
+    }
+  }
+  return OB_NOT_NULL(entry) ? entry : free_entry;
+}
 
 } // namespace
 
@@ -170,11 +188,13 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 {
   int ret = OB_SUCCESS;
   bool cache_hit = false;
+  ObTokenizeLiteralCache *literal_cache = get_tokenize_literal_cache(expr);
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(TOKENIZE_LITERAL_CACHE.get(expr, ctx, expr_datum, cache_hit))) {
+  } else if (OB_NOT_NULL(literal_cache)
+             && OB_FAIL(literal_cache->get(expr, ctx, expr_datum, cache_hit))) {
   } else if (cache_hit) {
   } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
@@ -189,7 +209,9 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
                                                        json_result,
                                                        expr_datum))) {
     } else {
-      TOKENIZE_LITERAL_CACHE.put(expr, ctx, expr_datum);
+      if (OB_NOT_NULL(literal_cache)) {
+        literal_cache->put(expr, ctx, expr_datum);
+      }
     }
   }
 
