@@ -43,8 +43,9 @@ namespace
 {
 
 // Cache only the deterministic, built-in TOKENIZE(text, parser) form.  A
-// single bounded entry per worker avoids parser/JSON reconstruction for hot
-// literal calls without changing dynamic or configured TOKENIZE semantics.
+// A small bounded set of entries per worker avoids parser/JSON reconstruction
+// for hot literal calls without changing dynamic or configured TOKENIZE
+// semantics.
 struct ObTokenizeLiteralCache
 {
   static constexpr int64_t MAX_KEY_SIZE = 2 * 1024;
