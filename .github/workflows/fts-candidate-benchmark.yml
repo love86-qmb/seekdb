@@ -138,17 +138,6 @@ jobs:
             --client "$CLIENT" --base-dir "$INSTANCE_DIR" \
             --port 2881 --timeout 240
 
-          # GitHub-hosted runners do not expose a usable hardware cycles event.
-          # Sample the userspace software clock instead and let timeout deliver
-          # SIGINT so perf writes a complete data header before reporting.
-          SEEKDB_PID="$(pgrep -n -x seekdb)"
-          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
-          sudo timeout --signal=INT --kill-after=5s 45s \
-            perf record -e cpu-clock:u -F 199 -p "$SEEKDB_PID" \
-              -o "$ARTIFACT_DIR/candidate-perf.data" \
-              2> "$ARTIFACT_DIR/candidate-perf-record.log" &
-          PERF_WRAPPER_PID=$!
-
           MYSQL="$CLIENT -h127.0.0.1 -P2881 -uroot -N -s --default-character-set=utf8mb4" \
           MYSQL_VERBOSE="$CLIENT -h127.0.0.1 -P2881 -uroot --default-character-set=utf8mb4" \
           OUTPUT="$ARTIFACT_DIR/candidate-report.txt" LABEL="candidate-${CANDIDATE_REF:0:12}" \
@@ -157,18 +146,55 @@ jobs:
             bash tools/benchmark/fts_large_bench.sh 2>&1 \
               | tee "$ARTIFACT_DIR/candidate-benchmark.log"
 
-          set +e
-          wait "$PERF_WRAPPER_PID"
-          PERF_STATUS=$?
-          set -e
-          echo "perf_wrapper_status=$PERF_STATUS" \
-            >> "$ARTIFACT_DIR/candidate-perf-record.log"
-          sudo perf report --stdio --no-children --percent-limit 0.1 \
-            --sort=dso,symbol \
-            -i "$ARTIFACT_DIR/candidate-perf.data" \
-            > "$ARTIFACT_DIR/candidate-perf-report.txt" \
-            2>> "$ARTIFACT_DIR/candidate-perf-record.log" || true
-          sudo rm -f "$ARTIFACT_DIR/candidate-perf.data"
+          # Profile the two hot paths only after the clean timed run.  Sampling
+          # the candidate during the timed A/B run makes its numbers unusable.
+          SEEKDB_PID="$(pgrep -n -x seekdb)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          TOKENIZE_SQL="$RUNNER_TEMP/fts-tokenize-profile.sql"
+          QUERY_SQL="$RUNNER_TEMP/fts-query-profile.sql"
+          printf '%s\n' 'SET NAMES utf8mb4;' > "$TOKENIZE_SQL"
+          for ((i = 0; i < 50000; ++i)); do
+            printf '%s\n' \
+              "SELECT tokenize('OceanBase是一款非常稳定的数据库，全文索引的分词器热路径优化包括解析器实例复用、停用词全局单例、内存池化数据结构等技术，在大量文档索引和查询场景下可以显著降低 CPU 开销。', 'ik');" \
+              "SELECT tokenize('The quick brown fox jumps over the lazy dog. Full-text search indexing requires efficient tokenization on the hot path.', 'beng');" \
+              >> "$TOKENIZE_SQL"
+          done
+          printf '%s\n' 'SET NAMES utf8mb4;' > "$QUERY_SQL"
+          for ((i = 0; i < 1000; ++i)); do
+            printf '%s\n' \
+              "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');" \
+              "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');" \
+              "SELECT COUNT(*) FROM fts_large_bench.docs WHERE MATCH(title, content) AGAINST('OceanBase 稳定 database');" \
+              "SELECT COUNT(*) FROM (SELECT id FROM fts_large_bench.docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;" \
+              >> "$QUERY_SQL"
+          done
+
+          profile_workload() {
+            local label="$1" sql_file="$2"
+            sudo timeout --signal=INT --kill-after=5s 30s \
+              perf record -e cpu-clock:u -F 99 -p "$SEEKDB_PID" \
+                -o "$ARTIFACT_DIR/${label}-perf.data" \
+                2> "$ARTIFACT_DIR/${label}-perf-record.log" &
+            local perf_pid=$!
+            sleep 1
+            "$CLIENT" -h127.0.0.1 -P2881 -uroot -N -s \
+              --default-character-set=utf8mb4 < "$sql_file" >/dev/null
+            set +e
+            sudo kill -INT "$perf_pid" 2>/dev/null
+            wait "$perf_pid"
+            local perf_status=$?
+            set -e
+            echo "perf_wrapper_status=$perf_status" \
+              >> "$ARTIFACT_DIR/${label}-perf-record.log"
+            sudo perf report --stdio --no-children --percent-limit 0.1 \
+              --sort=dso,symbol \
+              -i "$ARTIFACT_DIR/${label}-perf.data" \
+              > "$ARTIFACT_DIR/${label}-perf-report.txt" \
+              2>> "$ARTIFACT_DIR/${label}-perf-record.log" || true
+            sudo rm -f "$ARTIFACT_DIR/${label}-perf.data"
+          }
+          profile_workload tokenize "$TOKENIZE_SQL"
+          profile_workload query "$QUERY_SQL"
 
           python3 .github/script/seekdb/sdb.py destroy --base-dir "$INSTANCE_DIR"
 
